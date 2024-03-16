@@ -11,9 +11,6 @@ from torch import nn
 import torch.utils.checkpoint
 
 INIT_DEVICE = 'meta'
-SHIFTED_RELU = 1
-#SHIFTED_RELU_ATTN = 0
-#SHIFTED_RELU_FFN = 1
 
 @dataclass
 class ModelArgs:
@@ -26,7 +23,8 @@ class ModelArgs:
     hidden_dim: Optional[int] = None
     multiple_of: int = 256  # MLP hidden layer size will be multiple of
     norm_eps: float = 1e-5
-    max_seq_len: int = 2048
+    max_seq_len: int = 16384
+    rope_theta: float = 1000000.0
     dropout: float = 0.0
 
 
@@ -183,33 +181,10 @@ class FeedForward(nn.Module):
         self.w2 = nn.Linear(hidden_dim, dim, bias=False, device=INIT_DEVICE)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False, device=INIT_DEVICE)
         self.dropout = nn.Dropout(dropout)
-        
-        self.count = 0
-        self.stats = 0
-        self.coverage = 0
-        self.bins = None
 
     def forward(self, x):
         # 512, 64, 192; batch, context_len, hidden_dim
-        relufied = F.relu(self.w1(x) - SHIFTED_RELU) # shifted relu to maximize sparsity
-        #pred = (torch.sigmoid(self.lora_u(self.lora_d(x)))>0.5).type_as(relufied)
-        #coverage = torch.count_nonzero(torch.logical_xor(relufied, pred))/np.prod(relufied.size())
-        #relufied = pred*relufied
-        
-        n=1
-        # 64/n, 512, n, 192; context_len/window_len, batch, window_len, hidden_dim
-        sample = torch.stack(torch.split(relufied, n, dim=1))
-        # 64/n, 512, 192; context_len/window_len, batch, hidden_dim
-        sample = torch.sum(sample, dim=2)
-        coverage = torch.mean(torch.count_nonzero(sample, dim=2)/(relufied.size()[2]))
-        stats = torch.count_nonzero(relufied)/np.prod(relufied.size())
-
-        self.coverage = (self.coverage * (self.count/(self.count+1))) + (coverage * (1/(self.count+1)))
-        self.stats = (self.stats * (self.count/(self.count+1))) + (stats * (1/(self.count+1)))
-        self.count += 1
-
-        return self.dropout(self.w2(relufied * self.w3(x))) # llama
-        # return self.dropout(self.w2(relufied)) # OPT
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x))) # llama
 
 
 class TransformerBlock(nn.Module):
@@ -228,30 +203,11 @@ class TransformerBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.attn_stats = 0
-        self.attn_count = 0
-        self.ffn_stats = 0
-        self.ffn_count = 0
 
     def forward(self, x, freqs_cos, freqs_sin):
-        # attn_relu = F.relu(self.attention_norm(x))
-        attn_relu = self.attention_norm(x)
-        # h = x + self.attention.forward(attn_relu, freqs_cos, freqs_sin)
-        h = torch.utils.checkpoint.checkpoint(torch.add, x, self.attention.forward(attn_relu, freqs_cos, freqs_sin), use_reentrant=True)
-        h.requires_grad_(True)
-        # ffn_relu = F.relu(self.ffn_norm(h))
-        ffn_relu = self.ffn_norm(h)
-        # out = h + self.feed_forward.forward(ffn_relu)
-        out = torch.utils.checkpoint.checkpoint(torch.add, h, self.feed_forward.forward(ffn_relu), use_reentrant=True)
-        out.requires_grad_(True)
-
-        self.attn_stats = (self.attn_stats * (self.attn_count/(self.attn_count+1))) + \
-                            (torch.count_nonzero(attn_relu)/np.prod(attn_relu.size()) * (1/(self.attn_count+1)))
-        self.attn_count += 1
-        
-        self.ffn_stats = (self.ffn_stats * (self.ffn_count/(self.ffn_count+1))) + \
-                            (torch.count_nonzero(ffn_relu)/np.prod(ffn_relu.size()) * (1/(self.ffn_count+1)))
-        self.ffn_count += 1
+        h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
+        ffn = self.ffn_norm(h)
+        out = h + self.feed_forward.forward(ffn)
 
         return out
 
@@ -274,10 +230,10 @@ class Transformer(nn.Module):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False, device=INIT_DEVICE)
 
         # share the unembedding parameters with the embedding parameters
-        self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
+        # self.tok_embeddings.weight = self.output.weight # https://paperswithcode.com/method/weight-tying
 
         # some useful precompute for the RoPE relative positional embeddings
-        freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len)
+        freqs_cos, freqs_sin = precompute_freqs_cis(self.params.dim // self.params.n_heads, self.params.max_seq_len, self.params.rope_theta)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
@@ -387,17 +343,20 @@ class Transformer(nn.Module):
                 logits = logits / temperature
                 # optionally crop the logits to only the top k options
                 if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    v, top_k_idx = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('Inf')
+                    #print("top_k V: ", v)
+                    print("top_k tokens:", top_k_idx)
                 # apply softmax to convert logits to (normalized) probabilities
                 probs = F.softmax(logits, dim=-1)
+                print("top_k prob:", torch.take(probs, top_k_idx))
                 idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
             print(idx_next)
 
-            if enc is not None:
-                print(enc(idx, skip_special_tokens = True)[0])
+            #if enc is not None:
+                #print(enc(idx, skip_special_tokens = True)[0])
                 #print(enc.decode(idx[0].tolist()))
 
         return idx

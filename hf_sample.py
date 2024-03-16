@@ -2,11 +2,11 @@ import torch
 import os
 import time
 
-from model import Transformer, ModelArgs
+from hf_model import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 
-DEVICE = "cuda:0"
-DTYPE = torch.float16
+DEVICE = "cuda:7"
+DTYPE = torch.bfloat16
 GROUP_SIZE = 64
 
 # start by running in int8, then move on to int4
@@ -66,7 +66,7 @@ def remap_names(file):
                 split_keys[i] = nameMap_reverse[split_keys[i]]
         model_dict[".".join(split_keys)] = model_dict.pop(k)
     
-    #\for k,v in list(model_dict.items()):
+    #for k,v in list(model_dict.items()):
     #    model_dict[k] = v.to(torch.float16)
     
     return model_dict
@@ -89,13 +89,9 @@ for file in dir:
     #dequant = dequantize_q40(w, s, 64, v.shape)
     #print("Avg error: ", torch.mean(torch.abs(v - dequant)))
 
-breakpoint()
 model = Transformer(ModelArgs) #default is llama7B
-breakpoint()
 model.load_state_dict(model_dict, strict=True, assign=True)
-breakpoint()
-model.to(DEVICE)
-breakpoint()
+model.to(DEVICE, dtype=DTYPE)
 model.eval()
 
 tokenizer = CodeLlamaTokenizer.from_pretrained("./CodeLlama-7b-Instruct-hf")
@@ -118,7 +114,7 @@ input_ids = input_ids.to(DEVICE)
 print(input_ids)
 
 print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
-generated_ids = model.generate(input_ids, 1, temperature=0.9, top_k=32, enc=tokenizer.batch_decode)
+generated_ids = model.generate(input_ids, 512, temperature=0.1, top_k=32, enc=tokenizer.batch_decode)
 print("Time taken: ", time.time() - start)
 
 print(generated_ids)
