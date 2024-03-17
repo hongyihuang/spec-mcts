@@ -5,11 +5,11 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
-from model import Transformer, ModelArgs
+from hf_model import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 import torch.nn.functional as F
 
-DEVICE = "mps"
+DEVICE = "cuda:1"
 DTYPE = torch.float16
 GROUP_SIZE = 64
 
@@ -24,24 +24,30 @@ def quantize_q80(w, group_size):
     wmax = torch.abs(w).max(dim=1).values
     
     # calculate the scaling factor such that float = quant * scale
-    scale = wmax / 127.0
+    scale = wmax / 7.0 #127.0
     scale = scale.type(DTYPE)
+    scale = scale[:,None]
     # scale into range [-127, 127]
-    quant = w / scale[:,None]
+    quant = w / scale
     # round to nearest integer
     int8val = torch.round(quant).to(torch.int8)
+    int8val = int8val.view(-1, group_size)
+
+    # print(int8val.max(), int8val.min())
+    assert(int8val.max() <= 7.0)
+    assert(int8val.min() >= -7.0)
 
     return int8val, scale #, maxerr
 
-def dequantize_q80(w, scale, group_size, shape, ptdtype=torch.float32):
+def dequantize_q80(w, scale, group_size, shape, ptdtype):
     """
-    takes a Q8_0 tensor and returns the float32 version
+    takes a Q8_0 tensor and returns the float version
     """
-    w = w.view(-1, group_size)
+    # assume it is already packed by group_size
+    # w = w.view(-1, group_size)
 
     # dequantize by rescaling
-    fpval = (w.type(ptdtype) * scale[:,None]).view(-1)
-    return fpval.reshape(shape)
+    return (w * scale).reshape(shape)
 
 def quantize_q40(w, group_size):
     """
@@ -56,13 +62,21 @@ def quantize_q40(w, group_size):
     # calculate the scaling factor such that float = quant * scale
     scale = wmax / 7.0
     scale = scale.type(DTYPE)
+    scale = scale[:,None]
     # scale into range [-7, 7]
-    quant = w / scale[:,None]
+    quant = w / scale
     # round to nearest integer
+    
+    #assert(quant.max() <= 7)
+    #assert(quant.min() >= -7)
+    
     int8val = torch.round(quant).to(torch.int8)
     MSB = int8val.reshape(-1, 2, group_size)[:, 0, :]
     LSB = int8val.reshape(-1, 2, group_size)[:, 1, :]
+    assert(MSB.abs().max() <= 7)
+    assert(LSB.abs().min() >= -7)
     int8val = (MSB << 4) | (LSB & 0x0F)
+    int8val = int8val.view(-1, group_size)
 
     return int8val, scale #, maxerr
 
@@ -70,13 +84,15 @@ def dequantize_q40(w, scale, group_size, shape, ptdtype):
     """
     takes a Q4_0 tensor and returns the dequantized version
     """
-    w = w.view(-1, group_size)
-    MSB = (w & 0xF0) >> 4
-    LSB = w & 0x0F
+    # assume it is already packed by group_size
+    # w = w.view(-1, group_size)
+
+    MSB = w >> 4
+    LSB = w << 4 >> 4 # DO NOT JUST MASK OUT THE MSB, SIGN EXT
     w = torch.hstack((MSB, LSB)).view(-1, group_size)
 
     # dequantize by rescaling
-    fpval = (w.type(ptdtype) * scale[:,None]).view(-1)
+    fpval = (w * scale)#.type(ptdtype)
     return fpval.reshape(shape)
 
 '''
@@ -201,19 +217,32 @@ for file in dir:
 class LinearQ4_0(torch.nn.Module):
     def __init__(self, linear):
         super().__init__()
-        self.linear_w, self.linear_s = quantize_q80(linear.weight, GROUP_SIZE)
-        self.linear_w.to(DEVICE)
-        self.linear_s.to(DEVICE)
+        self.linear_w, self.linear_s = quantize_q40(linear.weight, GROUP_SIZE)
+        self.linear_w = self.linear_w.to(DEVICE)
+        self.linear_s = self.linear_s.to(DEVICE)
         self.linear_shape = linear.weight.shape
+        #breakpoint()
+        '''
+        linear_w_80, linear_s_80 = quantize_q80(linear.weight, GROUP_SIZE)
+        linear_w_80 = linear_w_80.to(DEVICE)
+        linear_s_80 = linear_s_80.to(DEVICE)
+        q40 = dequantize_q40(self.linear_w, self.linear_s, GROUP_SIZE, self.linear_shape, DTYPE)
+        q80 = dequantize_q80(linear_w_80, linear_s_80, GROUP_SIZE, self.linear_shape, DTYPE)
+        assert torch.sum(q40 - q80) == 0.0
+        '''
         del linear
 
     def forward(self, x):
         #start = time.time()
-        deq = dequantize_q80(self.linear_w, self.linear_s, GROUP_SIZE, self.linear_shape, DTYPE).to(DEVICE)
-        #print("Dequantize time: ", time.time() - start)
-        #start = time.time()
+        deq = dequantize_q40(self.linear_w, self.linear_s, GROUP_SIZE, self.linear_shape, DTYPE)#.to(DEVICE)
+        #end = time.time()
+        #breakpoint()
         result = F.linear(x, deq)
-        #print("Linear time: ", time.time() - start)
+        #COMP_TIME += time.time() - end
+        #DEQ_TIME += end - start
+        
+        #print("DQ/Compute Time: ", (end - start)/(time.time() - end))
+        #print("Size in MB: ", torch.prod(torch.Tensor(list(deq.size())))*2/1024/1024)
         return result
 
 model = Transformer(ModelArgs) #default is llama7B
@@ -241,16 +270,17 @@ model.to(device = DEVICE, dtype = DTYPE)
 
 tokenizer = CodeLlamaTokenizer.from_pretrained("./CodeLlama-7b-Instruct-hf")
 
-PROMPT = '''# Write a python function to find the longest chain which can be formed from the given set of pairs.
-
-# Test Cases 
+PROMPT = '''[INST] <<SYS>> You are a programmer, write the following python function that passes the given tests
+<</SYS>>
+Test Cases 
 assert max_chain_length([Pair(5, 24), Pair(15, 25),Pair(27, 40), Pair(50, 60)], 4) == 3
 assert max_chain_length([Pair(1, 2), Pair(3, 4),Pair(5, 6), Pair(7, 8)], 4) == 4
 assert max_chain_length([Pair(19, 10), Pair(11, 12),Pair(13, 14), Pair(15, 16), Pair(31, 54)], 5) == 5
 
-def max_chain_length(pairs, n):
-    
+Write a function to find the longest chain which can be formed from the given set of pairs.
+[/INST]
 '''
+
 model.eval()
 input_ids = tokenizer(PROMPT, return_tensors="pt")["input_ids"]
 input_ids = input_ids.to(DEVICE)
@@ -258,8 +288,9 @@ print(input_ids)
 print("Generating...")
 
 print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
-generated_ids = model.generate(input_ids, 128, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
-
+start = time.time()
+generated_ids = model.generate(input_ids, 1024, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
+print("Tokens per second: ", (torch.prod(torch.tensor(list(generated_ids.size())))/(time.time() - start)).item())
 print(generated_ids)
 print(tokenizer.batch_decode(generated_ids[:, input_ids.shape[1]:], skip_special_tokens = True)[0])
 

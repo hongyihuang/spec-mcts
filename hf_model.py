@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 INIT_DEVICE = 'meta'
+DTYPE = torch.float16
 
 '''
 (Pdb) model.model.config
@@ -71,7 +72,6 @@ class RMSNorm(torch.nn.Module):
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    freqs = freqs.to(torch.bfloat16) # temporary debug measure! 
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)  # type: ignore
     freqs = torch.outer(t, freqs)  # type: ignore
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
@@ -126,8 +126,8 @@ def apply_rotary_emb(q, k, freqs_cis):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = freqs_cis.real.to(torch.bfloat16)
-    sin = freqs_cis.imag.to(torch.bfloat16)
+    cos = freqs_cis.real.to(DTYPE)
+    sin = freqs_cis.imag.to(DTYPE)
     cos = torch.cat((cos, cos), dim = 1)
     sin = torch.cat((sin, sin), dim = 1)
     q = torch.transpose(q, 1, 2)
@@ -173,7 +173,8 @@ class Attention(nn.Module):
                 args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
-            )
+            ),
+            dtype=DTYPE
         ).cuda()
         self.cache_v = torch.zeros(
             (
@@ -181,7 +182,8 @@ class Attention(nn.Module):
                 args.max_seq_len,
                 self.n_local_kv_heads,
                 self.head_dim,
-            )
+            ),
+            dtype=DTYPE
         ).cuda()
 
     def forward(
@@ -197,7 +199,6 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        #breakpoint()
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
         self.cache_k = self.cache_k.to(xq)
@@ -356,7 +357,7 @@ class Transformer(nn.Module):
                 idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
-            print(idx_next)
+            #print(idx_next)
 
             if idx_next == 2:
                 break
