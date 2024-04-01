@@ -8,6 +8,7 @@ from torch import nn
 
 INIT_DEVICE = 'meta'
 DTYPE = torch.float16
+GROUP_SIZE = 64
 
 '''
 (Pdb) model.model.config
@@ -55,6 +56,52 @@ class ModelArgs:
 
     max_batch_size: int = 1
     max_seq_len: int = 1024 # 16384
+
+def quantize_q40(w, group_size):
+    """
+    takes a tensor and returns the Q4_0 quantized version
+    i.e. symmetric quantization into int4, [-7, 7]
+    """
+    assert w.numel() % group_size == 0
+    w = w.reshape(-1, group_size)
+    # find the max in each group
+    wmax = torch.abs(w).max(dim=1).values
+    
+    # calculate the scaling factor such that float = quant * scale
+    scale = wmax / 7.0
+    scale = scale.type(DTYPE)
+    scale = scale[:,None]
+    # scale into range [-7, 7]
+    quant = w / scale
+    # round to nearest integer
+    
+    #assert(quant.max() <= 7)
+    #assert(quant.min() >= -7)
+    
+    int8val = torch.round(quant).to(torch.int8)
+    MSB = int8val.reshape(-1, 2, group_size)[:, 0, :]
+    LSB = int8val.reshape(-1, 2, group_size)[:, 1, :]
+    assert(MSB.abs().max() <= 7)
+    assert(LSB.abs().min() >= -7)
+    int8val = (MSB << 4) | (LSB & 0x0F)
+    int8val = int8val.view(-1, group_size)
+
+    return int8val, scale #, maxerr
+
+def dequantize_q40(w, scale, group_size, shape, ptdtype):
+    """
+    takes a Q4_0 tensor and returns the dequantized version
+    """
+    # assume it is already packed by group_size
+    # w = w.view(-1, group_size)
+
+    MSB = w >> 4
+    LSB = w << 4 >> 4 # DO NOT JUST MASK OUT THE MSB, SIGN EXT
+    w = torch.hstack((MSB, LSB)).view(-1, group_size)
+
+    # dequantize by rescaling
+    fpval = (w * scale)#.type(ptdtype)
+    return fpval.reshape(shape)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -150,6 +197,30 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
+class LinearQ4_0(torch.nn.Module):
+    def __init__(self, in_features, out_features, group_size):
+        super().__init__()
+        self.group_size = group_size
+        self.linear_w = torch.zeros((in_features * out_features / group_size / 2, group_size), device=INIT_DEVICE)
+        self.linear_s = torch.zeros((in_features * out_features / group_size), device=INIT_DEVICE)
+
+        self.linear_shape = (in_features, out_features)
+        # there must be an external function that init these tensors
+        # there are no good ways to do this currently due to pytorch API doesn't save added params that are non-differentiable
+
+    def forward(self, x):
+        #start = time.time()
+        deq = dequantize_q40(self.linear_w, self.linear_s, self.group_size, self.linear_shape, DTYPE)
+        #.to(DEVICE)
+        #end = time.time()
+        #breakpoint()
+        result = F.linear(x, deq)
+        #COMP_TIME += time.time() - end
+        #DEQ_TIME += end - start
+        
+        #print("DQ/Compute Time: ", (end - start)/(time.time() - end))
+        #print("Size in MB: ", torch.prod(torch.Tensor(list(deq.size())))*2/1024/1024)
+        return result
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -162,10 +233,16 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
+        '''
         self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False, device=INIT_DEVICE)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device=INIT_DEVICE)
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device=INIT_DEVICE)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, device=INIT_DEVICE)
+        '''
+        self.wq = LinearQ4_0(args.dim, args.n_heads * self.head_dim, GROUP_SIZE)
+        self.wk = LinearQ4_0(args.dim, self.n_kv_heads * self.head_dim, GROUP_SIZE)
+        self.wv = LinearQ4_0(args.dim, self.n_kv_heads * self.head_dim, GROUP_SIZE)
+        self.wo = LinearQ4_0(args.n_heads * self.head_dim, args.dim, GROUP_SIZE)
 
         self.cache_k = torch.zeros(
             (
@@ -241,9 +318,9 @@ class FeedForward(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False, device=INIT_DEVICE)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False, device=INIT_DEVICE)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False, device=INIT_DEVICE)
+        self.w1 = LinearQ4_0(dim, hidden_dim, GROUP_SIZE)
+        self.w2 = LinearQ4_0(hidden_dim, dim, GROUP_SIZE)
+        self.w3 = LinearQ4_0(dim, hidden_dim, GROUP_SIZE)
 
     def forward(self, x):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))

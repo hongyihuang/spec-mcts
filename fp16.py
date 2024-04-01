@@ -5,7 +5,7 @@ import time
 from model import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 
-DEVICE = "cuda:0"
+DEVICE = "cuda:2"
 DTYPE = torch.float16
 GROUP_SIZE = 64
 
@@ -89,13 +89,9 @@ for file in dir:
     #dequant = dequantize_q40(w, s, 64, v.shape)
     #print("Avg error: ", torch.mean(torch.abs(v - dequant)))
 
-breakpoint()
 model = Transformer(ModelArgs) #default is llama7B
-breakpoint()
 model.load_state_dict(model_dict, strict=True, assign=True)
-breakpoint()
 model.to(DEVICE)
-breakpoint()
 model.eval()
 
 tokenizer = CodeLlamaTokenizer.from_pretrained("./CodeLlama-7b-Instruct-hf")

@@ -9,7 +9,7 @@ from hf_model import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 import torch.nn.functional as F
 
-DEVICE = "cuda:1"
+DEVICE = "cuda:3"
 DTYPE = torch.float16
 GROUP_SIZE = 64
 
@@ -95,49 +95,6 @@ def dequantize_q40(w, scale, group_size, shape, ptdtype):
     fpval = (w * scale)#.type(ptdtype)
     return fpval.reshape(shape)
 
-'''
-def sample(prompt="Once upon a time, ", max_new_tokens=128, temperature=0.9, top_k=32, num_samples=1, enc = None):
-    vocab_size = ModelArgs.vocab_size
-
-    if enc is None:
-        prompt_ids = enc.encode(prompt, bos=True, eos=False)
-    idx = (torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, ...])
-
-    # run generation
-    with torch.no_grad():
-        with ctx:
-            for k in range(num_samples):
-                for _ in range(max_new_tokens):
-                    # if the sequence context is growing too long we must crop it at block_size
-                    idx_cond = idx if idx.size(1) <= ModelArgs.max_seq_len else idx[:, -ModelArgs.params.max_seq_len:]
-                    # forward the model to get the logits for the index in the sequence
-                    logits = model(idx_cond) # dummy Y, doesn't matter
-                    logits = logits[:, -1, :] # crop to just the final time step
-                    if temperature == 0.0:
-                        # "sample" the single most likely index
-                        _, idx_next = torch.topk(logits, k=1, dim=-1)
-                    else:
-                        # pluck the logits at the final step and scale by desired temperature
-                        logits = logits / temperature
-                        # optionally crop the logits to only the top k options
-                        if top_k is not None:
-                            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                            logits[logits < v[:, [-1]]] = -float('Inf')
-                        # apply softmax to convert logits to (normalized) probabilities
-                        probs = F.softmax(logits, dim=-1)
-                        idx_next = torch.multinomial(probs, num_samples=1)
-                    # append sampled index to the running sequence and continue
-                    y = torch.cat((idx, idx_next), dim=1)
-                print(enc.decode(y[0].tolist()))
-                print(y)
-                print('---------------')
-'''
-
-# start by running in int8, then move on to int4
-# file = "./CodeLlama-7b-Instruct-hf/pytorch_model-00003-of-00003.bin"
-# model_dict = torch.load(file, map_location='cpu', mmap=True)
-
-# print(model_dict.keys())
 '''
 Name Map:
 
@@ -245,12 +202,15 @@ class LinearQ4_0(torch.nn.Module):
         #print("Size in MB: ", torch.prod(torch.Tensor(list(deq.size())))*2/1024/1024)
         return result
 
-model = Transformer(ModelArgs) #default is llama7B
-model.load_state_dict(model_dict, strict=False, assign=True)
+#model = Transformer(ModelArgs) #default is llama7B
+#model.load_state_dict(model_dict, strict=False, assign=True)
 
-model.eval()
+#model.eval()
 assign_lora = partial(LinearQ4_0)
+# match layers.x.{attention/feed_forward}.w{q/k/v/o} or w{1/2/3}
+# quantize them in dictionary
 
+'''
 for i, layer in enumerate(model.layers):
     layer.attention.wq = LinearQ4_0(layer.attention.wq)
     layer.attention.wk = LinearQ4_0(layer.attention.wk)
@@ -263,34 +223,33 @@ for i, layer in enumerate(model.layers):
     layer.attention_norm.to(device = DEVICE, dtype = DTYPE)
     layer.ffn_norm.to(device = DEVICE, dtype = DTYPE)
 
-model.output.to(device = DEVICE, dtype = DTYPE) # = LinearQ4_0(model.output)
+model.output.to(device = DEVICE, dtype = DTYPE)
 model.norm.to(device = DEVICE, dtype = DTYPE)
-#print(model)
-model.to(device = DEVICE, dtype = DTYPE)
-
-tokenizer = CodeLlamaTokenizer.from_pretrained("./CodeLlama-7b-Instruct-hf")
-
-PROMPT = '''[INST] <<SYS>> You are a programmer, write the following python function that passes the given tests
-<</SYS>>
-Test Cases 
-assert max_chain_length([Pair(5, 24), Pair(15, 25),Pair(27, 40), Pair(50, 60)], 4) == 3
-assert max_chain_length([Pair(1, 2), Pair(3, 4),Pair(5, 6), Pair(7, 8)], 4) == 4
-assert max_chain_length([Pair(19, 10), Pair(11, 12),Pair(13, 14), Pair(15, 16), Pair(31, 54)], 5) == 5
-
-Write a function to find the longest chain which can be formed from the given set of pairs.
-[/INST]
 '''
 
-model.eval()
-input_ids = tokenizer(PROMPT, return_tensors="pt")["input_ids"]
-input_ids = input_ids.to(DEVICE)
-print(input_ids.size())
-print("Generating...")
+for k,v in list(model_dict.items()):
+    keys = k.split(".")
+    if (keys[0] == "layers"):
+        layer = int(keys[1]) # layer number
+        if (keys[2] == "attention"):
+            if (keys[3] == "wq" or keys[3] == "wk" or keys[3] == "wv" or keys[3] == "wo"):
+                model_dict.pop(k)
+                k = ".".join(keys[:4])
+                w, s = quantize_q40(v, GROUP_SIZE)
+                model_dict[k + "." + "w"] = w
+                model_dict[k + "." + "s"] = s
+                model_dict[k + "." + "shape"] = v.shape
+        elif (keys[2] == "feed_forward"):
+            if (keys[3] == "w1" or keys[3] == "w2" or keys[3] == "w3"):
+                model_dict.pop(k)
+                k = ".".join(keys[:4])
+                w, s = quantize_q40(v, GROUP_SIZE)
+                model_dict[k + "." + "w"] = w
+                model_dict[k + "." + "s"] = s
+                model_dict[k + "." + "shape"] = v.shape
 
-print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
-start = time.time()
-generated_ids = model.generate(input_ids, 1024, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
-print("Tokens per second: ", (torch.prod(torch.tensor(list(generated_ids.size())))/(time.time() - start)).item())
-print(generated_ids.size())
-print(tokenizer.batch_decode(generated_ids[:, input_ids.shape[1]:], skip_special_tokens = True)[0])
+for k,v in list(model_dict.items()):
+    print(k, v.shape, v.dtype)
 
+#breakpoint()
+torch.save(model_dict, "./spec-mcts/models/llama7b_q40.pth")

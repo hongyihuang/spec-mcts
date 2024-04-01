@@ -5,7 +5,7 @@ import time
 from hf_model import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 
-DEVICE = "cuda:7"
+DEVICE = "cuda:3"
 DTYPE = torch.bfloat16
 GROUP_SIZE = 64
 

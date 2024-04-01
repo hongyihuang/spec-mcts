@@ -95,44 +95,6 @@ def dequantize_q40(w, scale, group_size, shape, ptdtype):
     fpval = (w * scale)#.type(ptdtype)
     return fpval.reshape(shape)
 
-'''
-def sample(prompt="Once upon a time, ", max_new_tokens=128, temperature=0.9, top_k=32, num_samples=1, enc = None):
-    vocab_size = ModelArgs.vocab_size
-
-    if enc is None:
-        prompt_ids = enc.encode(prompt, bos=True, eos=False)
-    idx = (torch.tensor(prompt_ids, dtype=torch.long, device=device)[None, ...])
-
-    # run generation
-    with torch.no_grad():
-        with ctx:
-            for k in range(num_samples):
-                for _ in range(max_new_tokens):
-                    # if the sequence context is growing too long we must crop it at block_size
-                    idx_cond = idx if idx.size(1) <= ModelArgs.max_seq_len else idx[:, -ModelArgs.params.max_seq_len:]
-                    # forward the model to get the logits for the index in the sequence
-                    logits = model(idx_cond) # dummy Y, doesn't matter
-                    logits = logits[:, -1, :] # crop to just the final time step
-                    if temperature == 0.0:
-                        # "sample" the single most likely index
-                        _, idx_next = torch.topk(logits, k=1, dim=-1)
-                    else:
-                        # pluck the logits at the final step and scale by desired temperature
-                        logits = logits / temperature
-                        # optionally crop the logits to only the top k options
-                        if top_k is not None:
-                            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                            logits[logits < v[:, [-1]]] = -float('Inf')
-                        # apply softmax to convert logits to (normalized) probabilities
-                        probs = F.softmax(logits, dim=-1)
-                        idx_next = torch.multinomial(probs, num_samples=1)
-                    # append sampled index to the running sequence and continue
-                    y = torch.cat((idx, idx_next), dim=1)
-                print(enc.decode(y[0].tolist()))
-                print(y)
-                print('---------------')
-'''
-
 # start by running in int8, then move on to int4
 # file = "./CodeLlama-7b-Instruct-hf/pytorch_model-00003-of-00003.bin"
 # model_dict = torch.load(file, map_location='cpu', mmap=True)
@@ -195,24 +157,22 @@ def remap_names(file):
     
     return model_dict
 
-model_dir = './CodeLlama-7b-Instruct-hf/'
-dir = os.listdir(model_dir)
-# access all {x}-of-00003.bin files
+model_file = './spec-mcts/models/llama7b_q40.pth'
+
 print(dir)
 model_dict = {}
-for file in dir:
-    if file.startswith("pytorch_model-"):
-        print("Loading file: ", model_dir + file)
-        curr_dict = remap_names(model_dir + file)
-        model_dict.update(curr_dict)
+print("Loading file: ", model_file)
+curr_dict = remap_names(model_file)
+model_dict.update(curr_dict)
 
-
-#for k,v in list(model_dict.items()):
-    #print(k, v.shape, v.dtype)
+for k,v in list(model_dict.items()):
+    print(k, v.shape, v.dtype)
     #w, s = quantize_q40(v, 64)
 
     #dequant = dequantize_q40(w, s, 64, v.shape)
     #print("Avg error: ", torch.mean(torch.abs(v - dequant)))
+
+breakpoint()
 
 class LinearQ4_0(torch.nn.Module):
     def __init__(self, linear):
