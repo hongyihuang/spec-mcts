@@ -5,95 +5,13 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
-from hf_model import Transformer, ModelArgs
+from hf_model_q40 import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 import torch.nn.functional as F
 
-DEVICE = "cuda:1"
-DTYPE = torch.float16
+DEVICE = "cuda:0"
+DTYPE = torch.bfloat16
 GROUP_SIZE = 64
-
-def quantize_q80(w, group_size):
-    """
-    takes a tensor and returns the Q8_0 quantized version
-    i.e. symmetric quantization into int8, range [-127,127]
-    """
-    assert w.numel() % group_size == 0
-    w = w.reshape(-1, group_size)
-    # find the max in each group
-    wmax = torch.abs(w).max(dim=1).values
-    
-    # calculate the scaling factor such that float = quant * scale
-    scale = wmax / 7.0 #127.0
-    scale = scale.type(DTYPE)
-    scale = scale[:,None]
-    # scale into range [-127, 127]
-    quant = w / scale
-    # round to nearest integer
-    int8val = torch.round(quant).to(torch.int8)
-    int8val = int8val.view(-1, group_size)
-
-    # print(int8val.max(), int8val.min())
-    assert(int8val.max() <= 7.0)
-    assert(int8val.min() >= -7.0)
-
-    return int8val, scale #, maxerr
-
-def dequantize_q80(w, scale, group_size, shape, ptdtype):
-    """
-    takes a Q8_0 tensor and returns the float version
-    """
-    # assume it is already packed by group_size
-    # w = w.view(-1, group_size)
-
-    # dequantize by rescaling
-    return (w * scale).reshape(shape)
-
-def quantize_q40(w, group_size):
-    """
-    takes a tensor and returns the Q4_0 quantized version
-    i.e. symmetric quantization into int4, [-7, 7]
-    """
-    assert w.numel() % group_size == 0
-    w = w.reshape(-1, group_size)
-    # find the max in each group
-    wmax = torch.abs(w).max(dim=1).values
-    
-    # calculate the scaling factor such that float = quant * scale
-    scale = wmax / 7.0
-    scale = scale.type(DTYPE)
-    scale = scale[:,None]
-    # scale into range [-7, 7]
-    quant = w / scale
-    # round to nearest integer
-    
-    #assert(quant.max() <= 7)
-    #assert(quant.min() >= -7)
-    
-    int8val = torch.round(quant).to(torch.int8)
-    MSB = int8val.reshape(-1, 2, group_size)[:, 0, :]
-    LSB = int8val.reshape(-1, 2, group_size)[:, 1, :]
-    assert(MSB.abs().max() <= 7)
-    assert(LSB.abs().min() >= -7)
-    int8val = (MSB << 4) | (LSB & 0x0F)
-    int8val = int8val.view(-1, group_size)
-
-    return int8val, scale #, maxerr
-
-def dequantize_q40(w, scale, group_size, shape, ptdtype):
-    """
-    takes a Q4_0 tensor and returns the dequantized version
-    """
-    # assume it is already packed by group_size
-    # w = w.view(-1, group_size)
-
-    MSB = w >> 4
-    LSB = w << 4 >> 4 # DO NOT JUST MASK OUT THE MSB, SIGN EXT
-    w = torch.hstack((MSB, LSB)).view(-1, group_size)
-
-    # dequantize by rescaling
-    fpval = (w * scale)#.type(ptdtype)
-    return fpval.reshape(shape)
 
 # start by running in int8, then move on to int4
 # file = "./CodeLlama-7b-Instruct-hf/pytorch_model-00003-of-00003.bin"
@@ -166,67 +84,52 @@ curr_dict = remap_names(model_file)
 model_dict.update(curr_dict)
 
 for k,v in list(model_dict.items()):
-    print(k, v.shape, v.dtype)
-    #w, s = quantize_q40(v, 64)
-
-    #dequant = dequantize_q40(w, s, 64, v.shape)
-    #print("Avg error: ", torch.mean(torch.abs(v - dequant)))
-
-breakpoint()
-
-class LinearQ4_0(torch.nn.Module):
-    def __init__(self, linear):
-        super().__init__()
-        self.linear_w, self.linear_s = quantize_q40(linear.weight, GROUP_SIZE)
-        self.linear_w = self.linear_w.to(DEVICE)
-        self.linear_s = self.linear_s.to(DEVICE)
-        self.linear_shape = linear.weight.shape
-        #breakpoint()
-        '''
-        linear_w_80, linear_s_80 = quantize_q80(linear.weight, GROUP_SIZE)
-        linear_w_80 = linear_w_80.to(DEVICE)
-        linear_s_80 = linear_s_80.to(DEVICE)
-        q40 = dequantize_q40(self.linear_w, self.linear_s, GROUP_SIZE, self.linear_shape, DTYPE)
-        q80 = dequantize_q80(linear_w_80, linear_s_80, GROUP_SIZE, self.linear_shape, DTYPE)
-        assert torch.sum(q40 - q80) == 0.0
-        '''
-        del linear
-
-    def forward(self, x):
-        #start = time.time()
-        deq = dequantize_q40(self.linear_w, self.linear_s, GROUP_SIZE, self.linear_shape, DTYPE)#.to(DEVICE)
-        #end = time.time()
-        #breakpoint()
-        result = F.linear(x, deq)
-        #COMP_TIME += time.time() - end
-        #DEQ_TIME += end - start
-        
-        #print("DQ/Compute Time: ", (end - start)/(time.time() - end))
-        #print("Size in MB: ", torch.prod(torch.Tensor(list(deq.size())))*2/1024/1024)
-        return result
+    if (k.split(".")[-1] == "shape"):
+        print(k, v)
+    else:
+        print(k, v.shape, v.dtype)
 
 model = Transformer(ModelArgs) #default is llama7B
 model.load_state_dict(model_dict, strict=False, assign=True)
 
-model.eval()
-assign_lora = partial(LinearQ4_0)
+for i, layer in enumerate(model.layers):    
+    key = "layers." + str(i)
+    layer.attention.wq.w = model_dict[key + ".attention.wq.w"].to(DEVICE)
+    layer.attention.wq.s = model_dict[key + ".attention.wq.s"].to(DEVICE)
+    layer.attention.wq.shape = model_dict[key + ".attention.wq.shape"]
 
-for i, layer in enumerate(model.layers):
-    layer.attention.wq = LinearQ4_0(layer.attention.wq)
-    layer.attention.wk = LinearQ4_0(layer.attention.wk)
-    layer.attention.wv = LinearQ4_0(layer.attention.wv)
-    layer.attention.wo = LinearQ4_0(layer.attention.wo)
-    layer.feed_forward.w1 = LinearQ4_0(layer.feed_forward.w1)
-    layer.feed_forward.w2 = LinearQ4_0(layer.feed_forward.w2)
-    layer.feed_forward.w3 = LinearQ4_0(layer.feed_forward.w3)
+    layer.attention.wk.w = model_dict[key + ".attention.wk.w"].to(DEVICE)
+    layer.attention.wk.s = model_dict[key + ".attention.wk.s"].to(DEVICE)
+    layer.attention.wk.shape = model_dict[key + ".attention.wk.shape"]
 
-    layer.attention_norm.to(device = DEVICE, dtype = DTYPE)
-    layer.ffn_norm.to(device = DEVICE, dtype = DTYPE)
+    layer.attention.wv.w = model_dict[key + ".attention.wv.w"].to(DEVICE)
+    layer.attention.wv.s = model_dict[key + ".attention.wv.s"].to(DEVICE)
+    layer.attention.wv.shape = model_dict[key + ".attention.wv.shape"]
 
-model.output.to(device = DEVICE, dtype = DTYPE) # = LinearQ4_0(model.output)
-model.norm.to(device = DEVICE, dtype = DTYPE)
-#print(model)
-model.to(device = DEVICE, dtype = DTYPE)
+    layer.attention.wo.w = model_dict[key + ".attention.wo.w"].to(DEVICE)
+    layer.attention.wo.s = model_dict[key + ".attention.wo.s"].to(DEVICE)
+    layer.attention.wo.shape = model_dict[key + ".attention.wo.shape"]
+
+    layer.feed_forward.w1.w = model_dict[key + ".feed_forward.w1.w"].to(DEVICE)
+    layer.feed_forward.w1.s = model_dict[key + ".feed_forward.w1.s"].to(DEVICE)
+    layer.feed_forward.w1.shape = model_dict[key + ".feed_forward.w1.shape"]
+
+    layer.feed_forward.w2.w = model_dict[key + ".feed_forward.w2.w"].to(DEVICE)
+    layer.feed_forward.w2.s = model_dict[key + ".feed_forward.w2.s"].to(DEVICE)
+    layer.feed_forward.w2.shape = model_dict[key + ".feed_forward.w2.shape"]
+
+    layer.feed_forward.w3.w = model_dict[key + ".feed_forward.w3.w"].to(DEVICE)
+    layer.feed_forward.w3.s = model_dict[key + ".feed_forward.w3.s"].to(DEVICE)
+    layer.feed_forward.w3.shape = model_dict[key + ".feed_forward.w3.shape"]
+
+model.to(device = DEVICE)
+
+model_curr_dict = model.state_dict()
+for k,v in list(model_curr_dict.items()):
+    if (k.split(".")[-1] == "shape"):
+        print(k, v)
+    else:
+        print(k, v.shape, v.dtype)
 
 tokenizer = CodeLlamaTokenizer.from_pretrained("./CodeLlama-7b-Instruct-hf")
 

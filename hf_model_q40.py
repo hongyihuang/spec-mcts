@@ -5,10 +5,14 @@ from typing import Any, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+import time
 
 INIT_DEVICE = 'meta'
-DTYPE = torch.float16
+DTYPE = torch.bfloat16
 GROUP_SIZE = 64
+
+COMP_TIME = 0.0
+DEQ_TIME = 0.0
 
 '''
 (Pdb) model.model.config
@@ -98,9 +102,9 @@ def dequantize_q40(w, scale, group_size, shape, ptdtype):
     MSB = w >> 4
     LSB = w << 4 >> 4 # DO NOT JUST MASK OUT THE MSB, SIGN EXT
     w = torch.hstack((MSB, LSB)).view(-1, group_size)
-
     # dequantize by rescaling
-    fpval = (w * scale)#.type(ptdtype)
+    fpval = (w * scale.expand(-1, group_size)).type(ptdtype)
+
     return fpval.reshape(shape)
 
 class RMSNorm(torch.nn.Module):
@@ -201,22 +205,21 @@ class LinearQ4_0(torch.nn.Module):
     def __init__(self, in_features, out_features, group_size):
         super().__init__()
         self.group_size = group_size
-        self.linear_w = torch.zeros((in_features * out_features / group_size / 2, group_size), device=INIT_DEVICE)
-        self.linear_s = torch.zeros((in_features * out_features / group_size), device=INIT_DEVICE)
+        self.w = torch.zeros((int(in_features * out_features / group_size / 2), group_size), dtype=torch.int8, device="cpu")
+        self.s = torch.zeros(int(in_features * out_features / group_size), dtype=DTYPE, device="cpu")
 
-        self.linear_shape = (in_features, out_features)
+        self.shape = (in_features, out_features)
         # there must be an external function that init these tensors
         # there are no good ways to do this currently due to pytorch API doesn't save added params that are non-differentiable
 
     def forward(self, x):
-        #start = time.time()
-        deq = dequantize_q40(self.linear_w, self.linear_s, self.group_size, self.linear_shape, DTYPE)
-        #.to(DEVICE)
-        #end = time.time()
-        #breakpoint()
+        start = time.time()
+        deq = dequantize_q40(self.w, self.s, self.group_size, self.shape, DTYPE).to("cuda:0")
+        end = time.time()
         result = F.linear(x, deq)
-        #COMP_TIME += time.time() - end
-        #DEQ_TIME += end - start
+        global COMP_TIME, DEQ_TIME
+        COMP_TIME += time.time() - end
+        DEQ_TIME += end - start
         
         #print("DQ/Compute Time: ", (end - start)/(time.time() - end))
         #print("Size in MB: ", torch.prod(torch.Tensor(list(deq.size())))*2/1024/1024)

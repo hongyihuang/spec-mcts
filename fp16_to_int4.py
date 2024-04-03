@@ -9,7 +9,7 @@ from hf_model import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 import torch.nn.functional as F
 
-DEVICE = "cuda:3"
+DEVICE = "cuda"
 DTYPE = torch.float16
 GROUP_SIZE = 64
 
@@ -161,95 +161,41 @@ for file in dir:
     if file.startswith("pytorch_model-"):
         print("Loading file: ", model_dir + file)
         curr_dict = remap_names(model_dir + file)
+
+        for k,v in list(curr_dict.items()):
+            keys = k.split(".")
+            if (keys[0] == "layers"):
+                layer = int(keys[1]) # layer number
+                if (keys[2] == "attention"):
+                    if (keys[3] == "wq" or keys[3] == "wk" or keys[3] == "wv" or keys[3] == "wo"):
+                        curr_dict.pop(k)
+                        k = ".".join(keys[:4])
+                        w, s = quantize_q40(v, GROUP_SIZE)
+                        curr_dict[k + "." + "w"] = w
+                        curr_dict[k + "." + "s"] = s
+                        curr_dict[k + "." + "shape"] = v.shape
+                elif (keys[2] == "feed_forward"):
+                    if (keys[3] == "w1" or keys[3] == "w2" or keys[3] == "w3"):
+                        curr_dict.pop(k)
+                        k = ".".join(keys[:4])
+                        w, s = quantize_q40(v, GROUP_SIZE)
+                        curr_dict[k + "." + "w"] = w
+                        curr_dict[k + "." + "s"] = s
+                        curr_dict[k + "." + "shape"] = v.shape
+
+        for k,v in list(curr_dict.items()):
+            if (k.split(".")[-1] == "shape"):
+                print(k, v)
+            else:
+                print(k, v.shape, v.dtype)
+
         model_dict.update(curr_dict)
 
-
-#for k,v in list(model_dict.items()):
-    #print(k, v.shape, v.dtype)
-    #w, s = quantize_q40(v, 64)
-
-    #dequant = dequantize_q40(w, s, 64, v.shape)
-    #print("Avg error: ", torch.mean(torch.abs(v - dequant)))
-
-class LinearQ4_0(torch.nn.Module):
-    def __init__(self, linear):
-        super().__init__()
-        self.linear_w, self.linear_s = quantize_q40(linear.weight, GROUP_SIZE)
-        self.linear_w = self.linear_w.to(DEVICE)
-        self.linear_s = self.linear_s.to(DEVICE)
-        self.linear_shape = linear.weight.shape
-        #breakpoint()
-        '''
-        linear_w_80, linear_s_80 = quantize_q80(linear.weight, GROUP_SIZE)
-        linear_w_80 = linear_w_80.to(DEVICE)
-        linear_s_80 = linear_s_80.to(DEVICE)
-        q40 = dequantize_q40(self.linear_w, self.linear_s, GROUP_SIZE, self.linear_shape, DTYPE)
-        q80 = dequantize_q80(linear_w_80, linear_s_80, GROUP_SIZE, self.linear_shape, DTYPE)
-        assert torch.sum(q40 - q80) == 0.0
-        '''
-        del linear
-
-    def forward(self, x):
-        #start = time.time()
-        deq = dequantize_q40(self.linear_w, self.linear_s, GROUP_SIZE, self.linear_shape, DTYPE)#.to(DEVICE)
-        #end = time.time()
-        #breakpoint()
-        result = F.linear(x, deq)
-        #COMP_TIME += time.time() - end
-        #DEQ_TIME += end - start
-        
-        #print("DQ/Compute Time: ", (end - start)/(time.time() - end))
-        #print("Size in MB: ", torch.prod(torch.Tensor(list(deq.size())))*2/1024/1024)
-        return result
-
-#model = Transformer(ModelArgs) #default is llama7B
-#model.load_state_dict(model_dict, strict=False, assign=True)
-
-#model.eval()
-assign_lora = partial(LinearQ4_0)
-# match layers.x.{attention/feed_forward}.w{q/k/v/o} or w{1/2/3}
-# quantize them in dictionary
-
-'''
-for i, layer in enumerate(model.layers):
-    layer.attention.wq = LinearQ4_0(layer.attention.wq)
-    layer.attention.wk = LinearQ4_0(layer.attention.wk)
-    layer.attention.wv = LinearQ4_0(layer.attention.wv)
-    layer.attention.wo = LinearQ4_0(layer.attention.wo)
-    layer.feed_forward.w1 = LinearQ4_0(layer.feed_forward.w1)
-    layer.feed_forward.w2 = LinearQ4_0(layer.feed_forward.w2)
-    layer.feed_forward.w3 = LinearQ4_0(layer.feed_forward.w3)
-
-    layer.attention_norm.to(device = DEVICE, dtype = DTYPE)
-    layer.ffn_norm.to(device = DEVICE, dtype = DTYPE)
-
-model.output.to(device = DEVICE, dtype = DTYPE)
-model.norm.to(device = DEVICE, dtype = DTYPE)
-'''
-
+breakpoint()
 for k,v in list(model_dict.items()):
-    keys = k.split(".")
-    if (keys[0] == "layers"):
-        layer = int(keys[1]) # layer number
-        if (keys[2] == "attention"):
-            if (keys[3] == "wq" or keys[3] == "wk" or keys[3] == "wv" or keys[3] == "wo"):
-                model_dict.pop(k)
-                k = ".".join(keys[:4])
-                w, s = quantize_q40(v, GROUP_SIZE)
-                model_dict[k + "." + "w"] = w
-                model_dict[k + "." + "s"] = s
-                model_dict[k + "." + "shape"] = v.shape
-        elif (keys[2] == "feed_forward"):
-            if (keys[3] == "w1" or keys[3] == "w2" or keys[3] == "w3"):
-                model_dict.pop(k)
-                k = ".".join(keys[:4])
-                w, s = quantize_q40(v, GROUP_SIZE)
-                model_dict[k + "." + "w"] = w
-                model_dict[k + "." + "s"] = s
-                model_dict[k + "." + "shape"] = v.shape
+    if (k.split(".")[-1] == "shape"):
+        print(k, v)
+    else:
+        print(k, v.shape, v.dtype)
 
-for k,v in list(model_dict.items()):
-    print(k, v.shape, v.dtype)
-
-#breakpoint()
 torch.save(model_dict, "./spec-mcts/models/llama7b_q40.pth")
