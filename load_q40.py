@@ -83,11 +83,13 @@ print("Loading file: ", model_file)
 curr_dict = remap_names(model_file)
 model_dict.update(curr_dict)
 
+'''
 for k,v in list(model_dict.items()):
     if (k.split(".")[-1] == "shape"):
         print(k, v)
     else:
         print(k, v.shape, v.dtype)
+'''
 
 model = Transformer(ModelArgs) #default is llama7B
 model.load_state_dict(model_dict, strict=False, assign=True)
@@ -124,12 +126,14 @@ for i, layer in enumerate(model.layers):
 
 model.to(device = DEVICE)
 
+'''
 model_curr_dict = model.state_dict()
 for k,v in list(model_curr_dict.items()):
     if (k.split(".")[-1] == "shape"):
         print(k, v)
     else:
         print(k, v.shape, v.dtype)
+'''
 
 tokenizer = CodeLlamaTokenizer.from_pretrained("./CodeLlama-7b-Instruct-hf")
 
@@ -152,8 +156,13 @@ print("Generating...")
 
 print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
 start = time.time()
-generated_ids = model.generate(input_ids, 1024, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
+generated_ids = model.generate(input_ids, batch_size = 16, max_new_tokens = 1024, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
+print("Total time: ", time.time() - start)
 print("Tokens per second: ", (torch.prod(torch.tensor(list(generated_ids.size())))/(time.time() - start)).item())
 print(generated_ids.size())
-print(tokenizer.batch_decode(generated_ids[:, input_ids.shape[1]:], skip_special_tokens = True)[0])
+decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
+
+print("Decoding results: ")
+for i in range(16):
+    print(decoded[i])
 

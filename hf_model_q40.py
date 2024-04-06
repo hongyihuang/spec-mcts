@@ -45,6 +45,7 @@ LlamaConfig {
   "vocab_size": 32016
 }
 '''
+#350-374 MB per batch
 
 @dataclass
 class ModelArgs:
@@ -58,7 +59,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     rope_theta: float = 1000000.0
 
-    max_batch_size: int = 1
+    max_batch_size: int = 16
     max_seq_len: int = 1024 # 16384
 
 def quantize_q40(w, group_size):
@@ -394,7 +395,7 @@ class Transformer(nn.Module):
         mask = None
         if seqlen > 1:
             mask = torch.full(
-                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
+                (1, 1, seqlen, seqlen + start_pos), float("-inf"), device=tokens.device
             )
             mask = mask.to(torch.float32).triu(diagonal=start_pos+1).type_as(h)
 
@@ -406,19 +407,42 @@ class Transformer(nn.Module):
         return output
     
     @torch.inference_mode()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, enc=None):
+    def generate(self, idx, batch_size, max_new_tokens, temperature=1.0, top_k=None, enc=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         Also note this is a super inefficient version of sampling with no key/value cache.
         """
-        for _ in range(max_new_tokens):
+        print("Decoding with: batch size =", batch_size)
+        assert self.params.max_batch_size >= batch_size
+        idx = idx.expand(batch_size, -1)
+        print("idx.shape", idx.shape)
+        curr_pos = 0
+        halt = 0
+        results = torch.zeros(batch_size, self.params.max_seq_len, dtype=torch.int64, device = idx.device)
+        results_len = torch.zeros(batch_size, dtype=torch.int32, device = idx.device)
+        results_mask = results_len == 0
+        print("results.shape", results.shape)
+
+        for num_new_tokens in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
+
             # forward the model to get the logits for the index in the sequence
-            logits = self(idx_cond, 0)
+            if (curr_pos == 0):
+                logits = self(idx_cond[:, curr_pos:], curr_pos)
+                curr_pos += idx_cond.shape[1]
+            else:
+                logits = self(results[:, num_new_tokens-1 : num_new_tokens], curr_pos)
+                curr_pos += 1
+            #print(curr_pos)
+
             logits = logits[:, -1, :] # crop to just the final time step
+            #print("logits.shape", logits.shape)
+
+            # DEAL WITH EACH TOKEN'S SAMPLING & BATCH DIVERGENCE PROBLEM
+            # try to get rid of this for loop, this may be slow
             if temperature == 0.0:
                 # "sample" the single most likely index
                 _, idx_next = torch.topk(logits, k=1, dim=-1)
@@ -436,14 +460,18 @@ class Transformer(nn.Module):
                 #print("top_k prob:", torch.take(probs, top_k_idx))
                 idx_next = torch.multinomial(probs, num_samples=1)
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
-            #print(idx_next)
+            # idx = torch.cat((idx, idx_next), dim=1)
+            results[:, num_new_tokens] = idx_next[:, 0] * results_mask.int()
+            #print(idx_next[:, 0])
 
-            if idx_next == 2:
-                break
-            
+            ends = (idx_next[:, 0] == 2)
+            results_mask = ~((ends) | ~results_mask)
+
             #if enc is not None:
                 #print(enc(idx, skip_special_tokens = True)[0])
                 #print(enc.decode(idx[0].tolist()))
+            
+            if (torch.sum(~results_mask) == batch_size) or (curr_pos == self.params.max_seq_len):
+                return results[:, :num_new_tokens]
 
-        return idx
+        return results, results_len
