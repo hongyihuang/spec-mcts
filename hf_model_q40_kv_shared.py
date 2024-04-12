@@ -65,8 +65,9 @@ class ModelArgs:
     norm_eps: float = 1e-5
     rope_theta: float = 1000000.0
 
-    max_batch_size: int = 64
-    max_seq_len: int = 512 # 16384
+    max_batch_size: int = 96
+    max_seq_len: int = 256 # 16384
+    max_prompt_seq_len: int = 256
 
 def quantize_q40(w, group_size):
     """
@@ -90,8 +91,8 @@ def quantize_q40(w, group_size):
     #assert(quant.min() >= -7)
     
     int8val = torch.round(quant).to(torch.int8)
-    MSB = int8val.reshape(-1, 2, group_size)[:, 0, :]
-    LSB = int8val.reshape(-1, 2, group_size)[:, 1, :]
+    MSB = int8val.view(-1, 2, group_size)[:, 0, :]
+    LSB = int8val.view(-1, 2, group_size)[:, 1, :]
     #assert(MSB.abs().max() <= 7)
     #assert(LSB.abs().min() >= -7)
     int8val = (MSB << 4) | (LSB & 0x0F)
@@ -99,7 +100,7 @@ def quantize_q40(w, group_size):
 
     return int8val, scale #, maxerr
 
-def dequantize_q40(w, scale, group_size, shape, ptdtype):
+def dequantize_q40(w, scale, group_size, shape, ptdtype: torch.dtype):
     """
     takes a Q4_0 tensor and returns the dequantized version
     """
@@ -110,9 +111,9 @@ def dequantize_q40(w, scale, group_size, shape, ptdtype):
     LSB = w << 4 >> 4 # DO NOT JUST MASK OUT THE MSB, SIGN EXT
     w = torch.hstack((MSB, LSB)).view(-1, group_size)
     # dequantize by rescaling
-    fpval = (w * scale.expand(-1, group_size)).type(ptdtype)
+    fpval = (w * scale).type(ptdtype) #(w * scale.expand(-1, group_size)).type(ptdtype)
 
-    return fpval.reshape(shape)
+    return fpval.view(shape)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -255,6 +256,27 @@ class Attention(nn.Module):
         self.wv = LinearQ4_0(args.dim, self.n_kv_heads * self.head_dim, GROUP_SIZE)
         self.wo = LinearQ4_0(args.n_heads * self.head_dim, args.dim, GROUP_SIZE)
 
+        self.cache_prompt_k = torch.zeros(
+            (
+                1,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            ),
+            dtype=DTYPE
+        ).cuda()
+
+        self.cache_prompt_v = torch.zeros(
+            (
+                1,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            ),
+            dtype=DTYPE
+        ).cuda()
+        self.cache_prompt_len = 0
+
         cache_k = torch.zeros(
             (
                 args.max_batch_size,
@@ -290,70 +312,92 @@ class Attention(nn.Module):
         start = time.time()
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        # .view may be faster
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        #print("x, xq, xk, xv: ", x.shape, xq.shape, xk.shape, xv.shape)
         QKVO_TIME += time.time() - start
         start = time.time()
 
-        kv_shape = (
-                self.args.max_batch_size,
-                self.args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim
-            )
-        #(w, scale, group_size, shape, ptdtype)
-        dequant_time = time.time()
-        deq_cache_k = dequantize_q40(self.cache_k, self.cache_k_s, GROUP_SIZE, kv_shape, DTYPE) 
-        deq_cache_v = dequantize_q40(self.cache_v, self.cache_v_s, GROUP_SIZE, kv_shape, DTYPE)
-        # maybe... only dequantize the relevant groups??
-        deq_cache_k[:bsz, start_pos : start_pos + seqlen] = xk
-        deq_cache_v[:bsz, start_pos : start_pos + seqlen] = xv
-        DQ_TIME += time.time() - dequant_time
-        #print("DQ: ", time.time() - dequant_time)
+        # when start_pos = 0, put to shared prompt KV cache
+        # when start_pos != 0, put to regular
+        if (start_pos == 0):
+            deq_cache_k = xk
+            deq_cache_v = xv
+            self.cache_prompt_k[:, :seqlen] = xk[0]
+            self.cache_prompt_v[:, :seqlen] = xv[0]
+            self.cache_prompt_len = seqlen
+        else:
+            dequant_time = time.time()
 
-        quant_time = time.time()
-        #self.cache_k, self.cache_k_s = quantize_q40(deq_cache_k, GROUP_SIZE)
-        #self.cache_v, self.cache_v_s = quantize_q40(deq_cache_v, GROUP_SIZE)
-        
-        q_start_pos = start_pos // (GROUP_SIZE) * GROUP_SIZE
-        q_end_pos = (((start_pos + seqlen) // (GROUP_SIZE)) + 1) * GROUP_SIZE
-        
-        cache_k, cache_k_s = quantize_q40(deq_cache_k[:bsz, q_start_pos:q_end_pos], GROUP_SIZE)
-        cache_v, cache_v_s = quantize_q40(deq_cache_v[:bsz, q_start_pos:q_end_pos], GROUP_SIZE)
-        
-        w_seq_block = self.n_local_kv_heads * self.head_dim // 2
-        s_seq_block = self.n_local_kv_heads * self.head_dim // 64
+            dq_start_pos = start_pos - self.cache_prompt_len
+            dq_end_pos = start_pos + seqlen - self.cache_prompt_len
+            q_start_pos = dq_start_pos // (GROUP_SIZE) * GROUP_SIZE
+            q_end_pos = ((dq_end_pos // (GROUP_SIZE)) + 1) * GROUP_SIZE
 
-        w_shape = (self.args.max_batch_size, self.args.max_seq_len, w_seq_block//64, 64)
-        s_shape = (self.args.max_batch_size, self.args.max_seq_len, s_seq_block, 1)
-        w_partial_shape = (self.args.max_batch_size, q_end_pos - q_start_pos, w_seq_block//64, 64)
-        s_partial_shape = (self.args.max_batch_size, q_end_pos - q_start_pos, s_seq_block, 1)
-        self.cache_k = self.cache_k.reshape(w_shape)
-        self.cache_v = self.cache_v.reshape(w_shape)
-        self.cache_k_s = self.cache_k_s.reshape(s_shape)
-        self.cache_v_s = self.cache_v_s.reshape(s_shape)
-        self.cache_k[:bsz, q_start_pos:q_end_pos] = cache_k.reshape(w_partial_shape)
-        self.cache_v[:bsz, q_start_pos:q_end_pos] = cache_v.reshape(w_partial_shape)
-        self.cache_k_s[:bsz, q_start_pos:q_end_pos] = cache_k_s.reshape(s_partial_shape)
-        self.cache_v_s[:bsz, q_start_pos:q_end_pos] = cache_v_s.reshape(s_partial_shape)
-        self.cache_k = self.cache_k.reshape(-1, 64)
-        self.cache_v = self.cache_v.reshape(-1, 64)
-        self.cache_k_s = self.cache_k_s.reshape(-1, 1)
-        self.cache_v_s = self.cache_v_s.reshape(-1, 1)
+            w_seq_block = self.n_local_kv_heads * self.head_dim // 2
+            s_seq_block = self.n_local_kv_heads * self.head_dim // 64
 
-        Q_TIME += time.time() - quant_time
-        #print("Q", time.time() - quant_time)
+            w_shape = (self.args.max_batch_size, self.args.max_seq_len, w_seq_block//64, 64)
+            s_shape = (self.args.max_batch_size, self.args.max_seq_len, s_seq_block, 1)
+            w_partial_shape = (bsz, q_end_pos - q_start_pos, w_seq_block//64, 64)
+            s_partial_shape = (bsz, q_end_pos - q_start_pos, s_seq_block, 1)
+
+            cache_k = self.cache_k.view(w_shape)[:bsz, :q_end_pos].reshape(-1, 64)
+            cache_v = self.cache_v.view(w_shape)[:bsz, :q_end_pos].reshape(-1, 64)
+            cache_k_s = self.cache_k_s.view(s_shape)[:bsz, :q_end_pos].reshape(-1, 1)
+            cache_v_s = self.cache_v_s.view(s_shape)[:bsz, :q_end_pos].reshape(-1, 1)
+            #print(cache_k.shape, cache_v.shape, cache_k_s.shape, cache_v_s.shape)
+            kv_shape = (bsz, q_end_pos, self.n_local_kv_heads, self.head_dim)
+            deq_cache_k = dequantize_q40(cache_k, cache_k_s, GROUP_SIZE, kv_shape, DTYPE)
+            deq_cache_v = dequantize_q40(cache_v, cache_v_s, GROUP_SIZE, kv_shape, DTYPE)
+            # append curr sequence
+            deq_cache_k[:bsz, dq_start_pos : dq_end_pos] = xk
+            deq_cache_v[:bsz, dq_start_pos : dq_end_pos] = xv
+
+            DQ_TIME += time.time() - dequant_time
+            #print("DQ: ", time.time() - dequant_time)
+
+            quant_time = time.time()
+            #self.cache_k, self.cache_k_s = quantize_q40(deq_cache_k, GROUP_SIZE)
+            #self.cache_v, self.cache_v_s = quantize_q40(deq_cache_v, GROUP_SIZE)
+            
+            cache_k, cache_k_s = quantize_q40(deq_cache_k[:bsz, q_start_pos:q_end_pos], GROUP_SIZE)
+            cache_v, cache_v_s = quantize_q40(deq_cache_v[:bsz, q_start_pos:q_end_pos], GROUP_SIZE)
+            '''
+            self.cache_k = self.cache_k.view(w_shape)
+            self.cache_v = self.cache_v.view(w_shape)
+            self.cache_k_s = self.cache_k_s.view(s_shape)
+            self.cache_v_s = self.cache_v_s.view(s_shape)
+            '''
+            self.cache_k.view(w_shape)[:bsz, q_start_pos:q_end_pos] = cache_k.view(w_partial_shape)
+            self.cache_v.view(w_shape)[:bsz, q_start_pos:q_end_pos] = cache_v.view(w_partial_shape)
+            self.cache_k_s.view(s_shape)[:bsz, q_start_pos:q_end_pos] = cache_k_s.view(s_partial_shape)
+            self.cache_v_s.view(s_shape)[:bsz, q_start_pos:q_end_pos] = cache_v_s.view(s_partial_shape)
+            '''
+            self.cache_k = self.cache_k.view(-1, 64)
+            self.cache_v = self.cache_v.view(-1, 64)
+            self.cache_k_s = self.cache_k_s.view(-1, 1)
+            self.cache_v_s = self.cache_v_s.view(-1, 1)
+            '''
+
+            # prepend prompt kv cache after storing the quantized cache
+            # print(start_pos, start_pos + seqlen, q_start_pos, q_end_pos)
+            deq_cache_k = torch.cat((self.cache_prompt_k.expand(bsz, -1, -1, -1)[:, :self.cache_prompt_len], deq_cache_k[:bsz]), dim=1)
+            deq_cache_v = torch.cat((self.cache_prompt_v.expand(bsz, -1, -1, -1)[:, :self.cache_prompt_len], deq_cache_v[:bsz]), dim=1)
+            # print(self.cache_prompt_k.shape, self.cache_prompt_k.dtype, deq_cache_k.shape, deq_cache_k.dtype)
+
+            Q_TIME += time.time() - quant_time
+            #print("Q", time.time() - quant_time)
 
         deq_cache_k = deq_cache_k.to(xq)
         deq_cache_v = deq_cache_v.to(xq)
 
         keys = deq_cache_k[:bsz, : start_pos + seqlen]
         values = deq_cache_v[:bsz, : start_pos + seqlen]
-
-        # when start_pos = 0, put to shared prompt KV cache
-        # when start_pos != 0, put to regular
+        #print("keys, values: ", keys.shape, values.shape)
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
@@ -362,14 +406,19 @@ class Attention(nn.Module):
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
+
+        '''
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        print(scores.shape)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        '''
+        output = F.scaled_dot_product_attention(xq, keys, values, mask)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         ATTN_TIME += time.time() - start
 
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
         return self.wo(output)
 
 
@@ -451,7 +500,7 @@ class Transformer(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads,
-            self.params.max_seq_len, # * 2
+            self.params.max_seq_len + self.params.max_prompt_seq_len, 
             params.rope_theta,
         )
 
@@ -490,7 +539,8 @@ class Transformer(nn.Module):
         print("idx.shape", idx.shape)
         curr_pos = 0
         halt = 0
-        max_new_tokens = min(max_new_tokens, self.params.max_seq_len-idx.shape[1])
+        assert self.params.max_prompt_seq_len >= idx.shape[1]
+        max_new_tokens = min(max_new_tokens, self.params.max_seq_len)
         results = torch.zeros(batch_size, max_new_tokens, dtype=torch.int64, device = idx.device)
         results_len = torch.zeros(batch_size, dtype=torch.int32, device = idx.device)
         results_mask = results_len == 0
@@ -544,7 +594,7 @@ class Transformer(nn.Module):
                 #print(enc(idx, skip_special_tokens = True)[0])
                 #print(enc.decode(idx[0].tolist()))
             
-            if (torch.sum(~results_mask) == batch_size) or (curr_pos == self.params.max_seq_len):
+            if (torch.sum(~results_mask) == batch_size):
                 print("DQ/Compute Time: ", DEQ_TIME/COMP_TIME)
                 print("Times:", QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME)
                 return results[:, :num_new_tokens], results_len

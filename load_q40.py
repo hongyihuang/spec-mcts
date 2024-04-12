@@ -5,7 +5,7 @@ import time
 from contextlib import nullcontext
 from datetime import datetime
 from functools import partial
-from hf_model_q40 import Transformer, ModelArgs
+from hf_model_q40_kv_shared import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 import torch.nn.functional as F
 
@@ -125,6 +125,8 @@ for i, layer in enumerate(model.layers):
     layer.feed_forward.w3.shape = model_dict[key + ".feed_forward.w3.shape"]
 
 model.to(device = DEVICE)
+#model = torch.compile(model)
+torch.backends.cuda.enable_flash_sdp(enabled = True)
 
 '''
 model_curr_dict = model.state_dict()
@@ -156,13 +158,18 @@ print("Generating...")
 
 print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
 start = time.time()
-generated_ids = model.generate(input_ids, batch_size = 16, max_new_tokens = 1024, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
+BATCH_SIZE = 80
+generated_ids, id_lens = model.generate(input_ids, batch_size = BATCH_SIZE, max_new_tokens = 1024, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
 print("Total time: ", time.time() - start)
 print("Tokens per second: ", (torch.prod(torch.tensor(list(generated_ids.size())))/(time.time() - start)).item())
 print(generated_ids.size())
 decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
 
 print("Decoding results: ")
-for i in range(16):
-    print(decoded[i])
+print(decoded[0])
+#print(generated_ids[0])
+#print(generated_ids[0])
+#for i in range(BATCH_SIZE):
+#    print(decoded[i])
 
+print(id_lens)
