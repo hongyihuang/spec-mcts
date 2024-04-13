@@ -8,6 +8,8 @@ from torch import nn
 import time
 from tqdm import tqdm
 
+from triton_kernels import triton_deq_int40
+
 INIT_DEVICE = 'meta'
 DTYPE = torch.bfloat16
 GROUP_SIZE = 64
@@ -114,6 +116,8 @@ def dequantize_q40(w, scale, group_size, shape, ptdtype: torch.dtype):
     fpval = (w * scale).type(ptdtype) #(w * scale.expand(-1, group_size)).type(ptdtype)
 
     return fpval.view(shape)
+
+dequantize_q40 = triton_deq_int40
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -525,6 +529,19 @@ class Transformer(nn.Module):
         output = self.output(h).float()
         return output
     
+    def fork(self, origin: int, new: [int]):
+        '''Forks the process, such that kv-cache is copied from origin batch number to all the list of new batches'''
+        return
+
+    def resetTimers(self):
+        global COMP_TIME, DEQ_TIME, QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME
+        COMP_TIME, DEQ_TIME, QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    def printTimers(self):
+        print("Linear DQ/Compute Time: ", DEQ_TIME/COMP_TIME)
+        print("Times: QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME")
+        print("Times:", QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME)
+    
     @torch.inference_mode()
     def generate(self, idx, batch_size, max_new_tokens, temperature=1.0, top_k=None, enc=None):
         """
@@ -546,6 +563,7 @@ class Transformer(nn.Module):
         results_mask = results_len == 0
         print("results.shape", results.shape)
 
+        # this entire loop will be moved to mcts.py and driven there
         for num_new_tokens in tqdm(range(max_new_tokens)):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
@@ -595,12 +613,10 @@ class Transformer(nn.Module):
                 #print(enc.decode(idx[0].tolist()))
             
             if (torch.sum(~results_mask) == batch_size):
-                print("DQ/Compute Time: ", DEQ_TIME/COMP_TIME)
-                print("Times:", QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME)
+                self.printTimers()
                 return results[:, :num_new_tokens], results_len
         
-        print("DQ/Compute Time: ", DEQ_TIME/COMP_TIME)
-        print("Times:", QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME)
+        self.printTimers()
         return results, results_len
 
 '''
