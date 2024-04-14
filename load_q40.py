@@ -158,8 +158,8 @@ print("Generating...")
 
 print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
 start = time.time()
-BATCH_SIZE = 80
-generated_ids, id_lens = model.generate(input_ids, batch_size = BATCH_SIZE, max_new_tokens = 1024, temperature=0.2, top_k=32, enc=tokenizer.batch_decode)
+BATCH_SIZE = 100
+generated_ids, id_lens = model.generate(input_ids, batch_size = BATCH_SIZE, max_new_tokens = 1024, temperature=0.3, top_k=32, enc=tokenizer.batch_decode)
 print("Total time: ", time.time() - start)
 print("Tokens per second: ", (torch.prod(torch.tensor(list(generated_ids.size())))/(time.time() - start)).item())
 print(generated_ids.size())

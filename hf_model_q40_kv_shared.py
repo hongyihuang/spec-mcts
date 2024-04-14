@@ -8,7 +8,7 @@ from torch import nn
 import time
 from tqdm import tqdm
 
-from triton_kernels import triton_deq_int40
+from triton_kernels import triton_deq_int40, triton_q_int40, matmul_q40
 
 INIT_DEVICE = 'meta'
 DTYPE = torch.bfloat16
@@ -67,7 +67,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     rope_theta: float = 1000000.0
 
-    max_batch_size: int = 96
+    max_batch_size: int = 100
     max_seq_len: int = 256 # 16384
     max_prompt_seq_len: int = 256
 
@@ -117,6 +117,7 @@ def dequantize_q40(w, scale, group_size, shape, ptdtype: torch.dtype):
 
     return fpval.view(shape)
 
+#quantize_q40 = triton_q_int40 # outputs gibberish after a while despite tested to be correct?
 dequantize_q40 = triton_deq_int40
 
 class RMSNorm(torch.nn.Module):
@@ -225,6 +226,16 @@ class LinearQ4_0(torch.nn.Module):
         # there are no good ways to do this currently due to pytorch API doesn't save added params that are non-differentiable
 
     def forward(self, x):
+        """
+        shape = x.shape
+        x=x.view((shape[0]*shape[1], -1)) # first dim is always 0, to optimize kernel we need 2d array
+        start = time.time()
+        # PyTorch w = w.transpose(), pretransposed in the file weights
+        result = matmul_q40(x, self.w, self.s, (self.shape[1], self.shape[0]))
+        global COMP_TIME, DEQ_TIME
+        COMP_TIME += time.time() - start
+        return result.view((shape[0], shape[1], -1))
+        """
         start = time.time()
         deq = dequantize_q40(self.w, self.s, self.group_size, self.shape, DTYPE).to("cuda:0")
         end = time.time()
@@ -232,6 +243,7 @@ class LinearQ4_0(torch.nn.Module):
         global COMP_TIME, DEQ_TIME
         COMP_TIME += time.time() - end
         DEQ_TIME += end - start
+        #print(x.shape, "x", self.shape)
         
         #print("DQ/Compute Time: ", (end - start)/(time.time() - end))
         #print("Size in MB: ", torch.prod(torch.Tensor(list(deq.size())))*2/1024/1024)
@@ -249,12 +261,6 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        '''
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False, device=INIT_DEVICE)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device=INIT_DEVICE)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device=INIT_DEVICE)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, device=INIT_DEVICE)
-        '''
         self.wq = LinearQ4_0(args.dim, args.n_heads * self.head_dim, GROUP_SIZE)
         self.wk = LinearQ4_0(args.dim, self.n_kv_heads * self.head_dim, GROUP_SIZE)
         self.wv = LinearQ4_0(args.dim, self.n_kv_heads * self.head_dim, GROUP_SIZE)
@@ -314,9 +320,7 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         global QKVO_TIME, ATTN_TIME, Q_TIME, DQ_TIME
         start = time.time()
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        # .view may be faster
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)        
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -370,22 +374,11 @@ class Attention(nn.Module):
             
             cache_k, cache_k_s = quantize_q40(deq_cache_k[:bsz, q_start_pos:q_end_pos], GROUP_SIZE)
             cache_v, cache_v_s = quantize_q40(deq_cache_v[:bsz, q_start_pos:q_end_pos], GROUP_SIZE)
-            '''
-            self.cache_k = self.cache_k.view(w_shape)
-            self.cache_v = self.cache_v.view(w_shape)
-            self.cache_k_s = self.cache_k_s.view(s_shape)
-            self.cache_v_s = self.cache_v_s.view(s_shape)
-            '''
+
             self.cache_k.view(w_shape)[:bsz, q_start_pos:q_end_pos] = cache_k.view(w_partial_shape)
             self.cache_v.view(w_shape)[:bsz, q_start_pos:q_end_pos] = cache_v.view(w_partial_shape)
             self.cache_k_s.view(s_shape)[:bsz, q_start_pos:q_end_pos] = cache_k_s.view(s_partial_shape)
             self.cache_v_s.view(s_shape)[:bsz, q_start_pos:q_end_pos] = cache_v_s.view(s_partial_shape)
-            '''
-            self.cache_k = self.cache_k.view(-1, 64)
-            self.cache_v = self.cache_v.view(-1, 64)
-            self.cache_k_s = self.cache_k_s.view(-1, 1)
-            self.cache_v_s = self.cache_v_s.view(-1, 1)
-            '''
 
             # prepend prompt kv cache after storing the quantized cache
             # print(start_pos, start_pos + seqlen, q_start_pos, q_end_pos)
@@ -539,8 +532,9 @@ class Transformer(nn.Module):
 
     def printTimers(self):
         print("Linear DQ/Compute Time: ", DEQ_TIME/COMP_TIME)
-        print("Times: QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME")
-        print("Times:", QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME)
+        print("Times: QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME, DEQ_TIME, COMP_TIME")
+        print("Times:", QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME, DEQ_TIME, COMP_TIME)
+        print("Measured Sum: ", QKVO_TIME+ ATTN_TIME+ MLP_TIME+ Q_TIME+ DQ_TIME+ DEQ_TIME+ COMP_TIME)
     
     @torch.inference_mode()
     def generate(self, idx, batch_size, max_new_tokens, temperature=1.0, top_k=None, enc=None):

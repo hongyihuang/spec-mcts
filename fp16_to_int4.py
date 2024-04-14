@@ -152,7 +152,7 @@ def remap_names(file):
     
     return model_dict
 
-model_dir = './CodeLlama-7b-Instruct-hf/'
+model_dir = './CodeLlama-70b-Instruct-hf/'
 dir = os.listdir(model_dir)
 # access all {x}-of-00003.bin files
 print(dir)
@@ -170,7 +170,7 @@ for file in dir:
                     if (keys[3] == "wq" or keys[3] == "wk" or keys[3] == "wv" or keys[3] == "wo"):
                         curr_dict.pop(k)
                         k = ".".join(keys[:4])
-                        w, s = quantize_q40(v, GROUP_SIZE)
+                        w, s = quantize_q40(v.t(), GROUP_SIZE)
                         curr_dict[k + "." + "w"] = w
                         curr_dict[k + "." + "s"] = s
                         curr_dict[k + "." + "shape"] = v.shape
@@ -178,7 +178,7 @@ for file in dir:
                     if (keys[3] == "w1" or keys[3] == "w2" or keys[3] == "w3"):
                         curr_dict.pop(k)
                         k = ".".join(keys[:4])
-                        w, s = quantize_q40(v, GROUP_SIZE)
+                        w, s = quantize_q40(v.t(), GROUP_SIZE)
                         curr_dict[k + "." + "w"] = w
                         curr_dict[k + "." + "s"] = s
                         curr_dict[k + "." + "shape"] = v.shape
@@ -198,4 +198,4 @@ for k,v in list(model_dict.items()):
     else:
         print(k, v.shape, v.dtype)
 
-torch.save(model_dict, "./spec-mcts/models/llama7b_q40.pth")
+torch.save(model_dict, "./spec-mcts/models/llama70b_q40_T.pth")
