@@ -8,6 +8,7 @@ from functools import partial
 from hf_model_q40_kv_shared import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 import torch.nn.functional as F
+import numpy as np
 
 DEVICE = "cuda:0"
 DTYPE = torch.bfloat16
@@ -157,19 +158,28 @@ print(input_ids.size())
 print("Generating...")
 
 print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
-start = time.time()
-BATCH_SIZE = 100
-generated_ids, id_lens = model.generate(input_ids, batch_size = BATCH_SIZE, max_new_tokens = 1024, temperature=0.3, top_k=32, enc=tokenizer.batch_decode)
-print("Total time: ", time.time() - start)
-print("Tokens per second: ", (torch.prod(torch.tensor(list(generated_ids.size())))/(time.time() - start)).item())
-print(generated_ids.size())
-decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
+batches = [1, 2, 4, 8, 16, 32, 64, 80, 96, 100]
+tps = torch.zeros((2, len(batches)), dtype=torch.float32)
+tps[0] = batches
 
-print("Decoding results: ")
-print(decoded[0])
-#print(generated_ids[0])
-#print(generated_ids[0])
-#for i in range(BATCH_SIZE):
-#    print(decoded[i])
+for i in range(len(batches)):
+    BATCH_SIZE = batches[i]
+    start = time.time()
+    generated_ids, id_lens = model.generate(input_ids, batch_size = BATCH_SIZE, max_new_tokens = 1024, temperature=0.3, top_k=32, enc=tokenizer.batch_decode)
+    print("Total time: ", time.time() - start)
+    tps[i] = (torch.prod(torch.tensor(list(generated_ids.size())))/(time.time() - start)).item()
+    print("Tokens per second: ", tps[1, i])
+    print(generated_ids.size())
+    decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
 
-print(id_lens)
+    print("Decoding results: ")
+    print(decoded[0])
+    #print(generated_ids[0])
+    #print(generated_ids[0])
+    #for i in range(BATCH_SIZE):
+    #    print(decoded[i])
+
+    print(id_lens)
+
+print("TPS:", tps)
+np.save("./stats/tps.npz", tps.numpy())

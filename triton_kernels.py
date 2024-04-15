@@ -459,17 +459,15 @@ def matmul_q40_kernel(
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
 
     b_w_ptrs = b_w_ptr + (offs_k[:, None] * stride_bw_k + offs_bn_w[None, :] * stride_bw_n)
-    #b_s_ptrs = b_s_ptr + (offs_k[:, None] * stride_bs_k + offs_bn_s[None, :] * stride_bs_n)
-    b_s0_ptrs = b_s_ptr + (offs_k[:, None] * stride_bs_k + offs_bn_s[None, :] * stride_bs_n)
-    #b_s1_ptrs = b_s_ptr + (offs_k[:, None] * stride_bs_k + (offs_bn_s[None, :]+1) * stride_bs_n)
+    b_s_ptrs = b_s_ptr + (offs_k[:, None] * stride_bs_k + offs_bn_s[None, :] * stride_bs_n)
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N//2), dtype=tl.float32)
-    accumulator1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N//2), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N//2), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N//2), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
@@ -477,26 +475,24 @@ def matmul_q40_kernel(
         #b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b_w = tl.load(b_w_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        b_s0 = tl.load(b_s0_ptrs)
-        b_s1 = tl.load(b_s0_ptrs + 1)
+        b_w0 = tl.load(b_w_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        b_s0 = tl.load(b_s_ptrs)
+        b_s1 = tl.load(b_s_ptrs + 1)
         #tl.static_print(b_w.shape, b_s0.shape, b_s1.shape)
-        b_MSB = ((b_w>>4) * b_s0).to(tl.bfloat16)
-        b_LSB = (((b_w<<28)>>28) * b_s1).to(tl.bfloat16)
+        b_MSB0 = ((b_w0>>4).to(tl.bfloat16) * b_s0)
+        b_LSB1 = (((b_w0<<28)>>28).to(tl.bfloat16) * b_s1)
         #tl.static_print(b_MSB.shape, b_LSB.shape)
 
         # We accumulate along the K dimension.
-        accumulator0 = tl.dot(a, b_MSB, accumulator0)
-        accumulator1 = tl.dot(a, b_LSB, accumulator1)
+        acc0 = tl.dot(a, b_MSB0, acc0)
+        acc1 = tl.dot(a, b_LSB1, acc1)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_w_ptrs += BLOCK_SIZE_K * stride_bw_k
-        b_s0_ptrs += BLOCK_SIZE_K * stride_bs_k
+        b_s_ptrs += BLOCK_SIZE_K * stride_bs_k
         #b_s1_ptrs += BLOCK_SIZE_K * stride_bs_k
     # You can fuse arbitrary activation functions here
     # while the accumulator is still in FP32!
-    c0 = accumulator0.to(tl.bfloat16)
-    c1 = accumulator1.to(tl.bfloat16)
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
@@ -504,12 +500,12 @@ def matmul_q40_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N//2)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c0, mask=c_mask)
+    tl.store(c_ptrs, acc0.to(tl.bfloat16), mask=c_mask)
 
     offs_cn += BLOCK_SIZE_N//2
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c1, mask=c_mask)
+    tl.store(c_ptrs, acc1.to(tl.bfloat16), mask=c_mask)
 
 def matmul_q40(a, b_w, b_s, b_shape):
     # Check constraints.

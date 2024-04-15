@@ -19,7 +19,7 @@ class mcts():
         self.max_batch = batch
         self.model = model
     
-    def initialize_nodes():
+    def initialize_nodes(self):
         self.curr = 0
         self.Q = torch.zeros(self.max_nodes, dtype = torch.float32)
         self.P = torch.zeros((self.max_nodes, self.actions), dtype = torch.bfloat16)
@@ -45,7 +45,7 @@ class mcts():
         
     def search(self, prompt: str, root_node: int, batch_size: int, max_depth: int):
         '''continuously expand at root node using batch_size until a solution is found'''
-        model.resetTimer()
+        self.model.resetTimer()
         curr_pos = 0
         # forward the model to get the logits for the index in the sequence
         if (curr_pos == 0):

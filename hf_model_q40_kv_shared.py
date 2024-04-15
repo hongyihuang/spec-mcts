@@ -266,50 +266,39 @@ class Attention(nn.Module):
         self.wv = LinearQ4_0(args.dim, self.n_kv_heads * self.head_dim, GROUP_SIZE)
         self.wo = LinearQ4_0(args.n_heads * self.head_dim, args.dim, GROUP_SIZE)
 
-        self.cache_prompt_k = torch.zeros(
-            (
-                1,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
-            dtype=DTYPE
-        ).cuda()
-
-        self.cache_prompt_v = torch.zeros(
-            (
-                1,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
-            dtype=DTYPE
-        ).cuda()
+        promptShape = (1, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
+        cacheShape = (args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
+        
+        self.cache_prompt_k = torch.zeros(promptShape, dtype=DTYPE).cuda()
+        self.cache_prompt_v = torch.zeros(promptShape, dtype=DTYPE).cuda()
         self.cache_prompt_len = 0
 
-        cache_k = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
-            dtype=DTYPE
-        ).cuda()
+        cache_k = torch.zeros(cacheShape, dtype=DTYPE).cuda()
         self.cache_k, self.cache_k_s = quantize_q40(cache_k, GROUP_SIZE)
 
-        cache_v = torch.zeros(
-            (
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_local_kv_heads,
-                self.head_dim,
-            ),
-            dtype=DTYPE
-        ).cuda()
-        
+        cache_v = torch.zeros(cacheShape, dtype=DTYPE).cuda()
         self.cache_v, self.cache_v_s = quantize_q40(cache_v, GROUP_SIZE)
+    
+    def fork(self, origin: int, new: [int]):
+        '''Forks the process, such that kv-cache is copied from origin batch number to all the list of new batches'''
+        self.cache_k = self.cache_k.view((self.args.max_batch_size, -1))
+        self.cache_k_s = self.cache_k_s.view((self.args.max_batch_size, -1))
+        self.cache_v = self.cache_v.view((self.args.max_batch_size, -1))
+        self.cache_v_s = self.cache_v_s.view((self.args.max_batch_size, -1))
+        for i in new:
+            self.cache_k[i, :] = self.cache_k[origin, :]
+            self.cache_k_s[i, :] = self.cache_k_s[origin, :]
+            self.cache_v[i, :] = self.cache_v[origin, :]
+            self.cache_v_s[i, :] = self.cache_v_s[origin, :]
+        self.cache_k = self.cache_k.view((-1, 64))
+        self.cache_k_s = self.cache_k_s.view((-1, 64))
+        self.cache_v = self.cache_v.view((-1, 1))
+        self.cache_v_s = self.cache_v_s.view((-1, 1))
 
+    def resetSeq(self):
+        '''Sets sequence length = 0'''
+        self.cache_prompt_len = 0
+    
     def forward(
         self,
         x: torch.Tensor,
@@ -524,6 +513,14 @@ class Transformer(nn.Module):
     
     def fork(self, origin: int, new: [int]):
         '''Forks the process, such that kv-cache is copied from origin batch number to all the list of new batches'''
+        for layer in self.layers:
+            layer.attention.fork(origin, new)
+        return
+    
+    def resetSeq(self):
+        '''Sets all sequence length = 0'''
+        for layer in self.layers:
+            layer.attention.resetSeq()
         return
 
     def resetTimers(self):
