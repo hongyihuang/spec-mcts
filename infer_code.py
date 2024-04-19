@@ -1,20 +1,67 @@
 import torch
-import math
-import os
-import time
-from contextlib import nullcontext
-from datetime import datetime
-from functools import partial
 from hf_model_q40_kv_shared import Transformer, ModelArgs
 from transformers import CodeLlamaTokenizer
 import torch.nn.functional as F
 import numpy as np
 from mcts import mcts
 
-DEVICE = "cuda:0"
+from tqdm import tqdm
+from datasets import load_dataset
+
+dataset_full = load_dataset("mbpp")
+print(dataset_full)
+
+group = 'test'
+
+desc = dataset_full[group]['text']
+code = dataset_full[group]['code']
+test = dataset_full[group]['test_list']
+setup = dataset_full[group]['test_setup_code']
+rows = dataset_full[group].num_rows
+print(f"Found {group} {rows} rows. Iterating through solutions to check...")
+
+success_count = 0
+fail_count = 0
+
+for i in tqdm(range(rows)):
+    success = True
+    for j in range(len(test[i])):
+        try:
+            appended_code = code[i] + "\r\n" + setup[i] + "\r\n" + test[i][j]
+            
+            exec(appended_code, globals(), locals())
+            success_count += 1
+        except Exception as e:
+            print("Test failed: ", i, j, test[i][j], e)
+            fail_count += 1
+            success = False
+    if not success:
+        print("Code: ", code[i])
+
+print("Success: ", success_count)
+print("Fail: ", fail_count)
+
+PROMPT = '''[INST] <<SYS>> You are a programmer, write a python function that passes the given tests. <</SYS>>
+Function task: 
+{desc[0]}
+
+Given test cases: 
+{"\n".join(test[0])}
+[/INST]
+[PYTHON]
+{setup[0]}
+'''
+
+#print("Example prompt: \n", PROMPT)
+#print("Example solution: \n", code[0] + "\r\n" + setup[0] + "\r\n" + "\n".join(test[0]))
+
+DEVICE = "cuda"
 DTYPE = torch.float16
 GROUP_SIZE = 64
-BATCH_SIZE = 80
+TEMP = 0.7
+BATCH_SIZE = 1
+SEQ_LEN = 256
+PROMPT_LEN = 512
 
 print(torch.__version__)
 
@@ -107,7 +154,9 @@ for k,v in list(model_dict.items()):
         print(k, v.shape, v.dtype)
 '''
 
-modelArgs = ModelArgs(max_batch_size = BATCH_SIZE)
+modelArgs = ModelArgs(max_batch_size = BATCH_SIZE, 
+                      max_prompt_seq_len = PROMPT_LEN,
+                      max_seq_len = SEQ_LEN)
 model = Transformer(modelArgs) #default is llama7B
 model.load_state_dict(model_dict, strict=False, assign=True)
 memoryStats()
@@ -146,6 +195,7 @@ model_dict = {} # deallocate CPU memory for model
 model.to(device = DEVICE, dtype = DTYPE)
 #model = torch.compile(model)
 torch.backends.cuda.enable_flash_sdp(enabled = True)
+torch.cuda.device(DEVICE)
 
 '''
 model_curr_dict = model.state_dict()
@@ -157,63 +207,53 @@ for k,v in list(model_curr_dict.items()):
 '''
 
 tokenizer = CodeLlamaTokenizer.from_pretrained("./CodeLlama-7b-Instruct-hf")
+tree = mcts(model, depth = SEQ_LEN, nodes=0, top_k=32, temp=TEMP)
 
-PROMPT = '''[INST] <<SYS>> You are a programmer, write the following python function that passes the given tests
-<</SYS>>
-Test Cases 
-assert max_chain_length([Pair(5, 24), Pair(15, 25),Pair(27, 40), Pair(50, 60)], 4) == 3
-assert max_chain_length([Pair(1, 2), Pair(3, 4),Pair(5, 6), Pair(7, 8)], 4) == 4
-assert max_chain_length([Pair(19, 10), Pair(11, 12),Pair(13, 14), Pair(15, 16), Pair(31, 54)], 5) == 5
+print("NOW RUNNING LLAMA 7B CODER!")
 
-Write a function to find the longest chain which can be formed from the given set of pairs.
-[/INST]
-[PYTHON]
-'''
-
-print("[PYTHON]", tokenizer("[PYTHON]", return_tensors="pt")["input_ids"])
-print("[/PYTHON]", tokenizer("[/PYTHON]", return_tensors="pt")["input_ids"])
+success_count = 0
+fail_count = 0
 
 model.eval()
-input_ids = tokenizer(PROMPT, return_tensors="pt")["input_ids"]
-input_ids = input_ids.to(DEVICE)
-print(input_ids.size())
-print("Generating...")
 
-print(tokenizer.batch_decode(input_ids, skip_special_tokens = True)[0])
-batches = [1, 4, 8, 16, 32, 48, 64, 80]
-tps = torch.zeros((3, len(batches)), dtype=torch.float32)
-tps[0] = torch.tensor(batches)
+all_results = torch.zeros((rows, BATCH_SIZE, SEQ_LEN), dtype=torch.int16)
+all_results_len = torch.zeros((rows, BATCH_SIZE), dtype=torch.int16)
+all_batch_stats = torch.zeros((rows, SEQ_LEN), dtype=torch.int16)
 
-for i in range(len(batches)):
-    batch = batches[i]
-    start = time.time()
-    tree = mcts(model, depth = 256, nodes=0, top_k=32, temp=0.3)
-    #generated_ids, id_lens = model.generate(input_ids, batch_size = batch, max_new_tokens = 1024, 
-    #                                        temperature=0.3, top_k=32, enc=tokenizer.batch_decode)
-    generated_ids, id_lens = tree.search(input_ids, batch)
-    end = time.time()
-    print("Total time: ", end - start)
-    memoryStats()
-    tps[1, i] = (torch.prod(torch.tensor(list(generated_ids.size())))/(end - start)).item()
-    print("Tokens per second: ", tps[1, i])
-    print(generated_ids.size())
-    decoded = tokenizer.batch_decode(generated_ids, skip_special_tokens = True)
+# Test saving empty to prevent directory error after running...
+SAVE = True
+SAVE_PATH = f"./spec-mcts/stats/infer_t{TEMP}_q{SEQ_LEN}_b{BATCH_SIZE}"
 
-    print("Decoding results: ")
-    print(decoded[0])
-    #print(generated_ids[0])
-    # 1 is start, 2 is end
-    # 29961 or 518 is "["
-    # "PYTHON]" tensor([[    1,   518, 20055,  4690,  1164, 29962]])
-    # "/PYTHON]" tensor([[    1,   518, 29914, 20055,  4690,  1164, 29962]])
+for i in tqdm(range(rows), desc="Tasks"):
+    print(f"Running row {i}")
+    success = True
+    PROMPT = f'''[INST] <<SYS>> You are a programmer, write a python function that passes the given tests. <</SYS>>
+Function task: 
+{desc[i]}
 
-    #for item in decoded:
-    #    print(item)
-    #    print("====")
+Given test cases: 
+{"\n".join(test[i])}
+[/INST]
+[PYTHON]
+{setup[i]}'''
+    input_ids = tokenizer(PROMPT, return_tensors="pt")["input_ids"]
+    input_ids = input_ids.to(DEVICE)
+    if (input_ids.numel() > PROMPT_LEN):
+        print(f"WARNING: PROMPT LEN {input_ids.size()} > {PROMPT_LEN} in row {i}")
+        continue
 
-    print(id_lens)
-    tps[2, i] = (torch.sum(id_lens)/(end-start)).item()
-    print("Corrected tps: ", tps[2, i])
+    results, results_len, batch_stats = tree.search(input_ids, BATCH_SIZE)
+    all_results[i, :results.shape[0], :results.shape[1]] = results
+    all_results_len[i, :results_len.shape[0]] = results_len
+    all_batch_stats[i, :batch_stats.shape[0]] = batch_stats
+    #breakpoint()
+    print("Length", results_len[0])
+    print(tokenizer.batch_decode(results, skip_special_tokens = True)[0])
+    #print(results[0, :results_len[0]])
+    if (i % 50 == 0) & SAVE:
+        np.savez(SAVE_PATH, 
+                 results = all_results, 
+                 results_len = all_results_len, 
+                 batch_stats = all_batch_stats)
 
-print("TPS:", tps)
-np.save("./spec-mcts/stats/tps_tree", tps.numpy())
+np.savez(SAVE_PATH, results = all_results, results_len = all_results_len, batch_stats = all_batch_stats)

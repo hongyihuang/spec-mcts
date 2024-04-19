@@ -11,7 +11,7 @@ from tqdm import tqdm
 from triton_kernels import triton_deq_int40, triton_q_int40, matmul_q40
 
 INIT_DEVICE = 'meta'
-DTYPE = torch.bfloat16
+DTYPE = torch.float16
 GROUP_SIZE = 64
 
 COMP_TIME = 0.0
@@ -67,7 +67,7 @@ class ModelArgs:
     norm_eps: float = 1e-5
     rope_theta: float = 1000000.0
 
-    max_batch_size: int = 100
+    max_batch_size: int = 80
     max_seq_len: int = 256 # 16384
     max_prompt_seq_len: int = 256
 
@@ -131,7 +131,7 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return (output * self.weight).type_as(x)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -237,7 +237,7 @@ class LinearQ4_0(torch.nn.Module):
         return result.view((shape[0], shape[1], -1))
         """
         start = time.time()
-        deq = dequantize_q40(self.w, self.s, self.group_size, self.shape, DTYPE).to("cuda:0")
+        deq = dequantize_q40(self.w, self.s, self.group_size, self.shape, DTYPE)#.to(self.w.device)
         end = time.time()
         result = F.linear(x, deq)
         global COMP_TIME, DEQ_TIME
@@ -266,7 +266,7 @@ class Attention(nn.Module):
         self.wv = LinearQ4_0(args.dim, self.n_kv_heads * self.head_dim, GROUP_SIZE)
         self.wo = LinearQ4_0(args.n_heads * self.head_dim, args.dim, GROUP_SIZE)
 
-        promptShape = (1, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
+        promptShape = (1, args.max_prompt_seq_len, self.n_local_kv_heads, self.head_dim)
         cacheShape = (args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim)
         
         self.cache_prompt_k = torch.zeros(promptShape, dtype=DTYPE).cuda()
@@ -279,17 +279,18 @@ class Attention(nn.Module):
         cache_v = torch.zeros(cacheShape, dtype=DTYPE).cuda()
         self.cache_v, self.cache_v_s = quantize_q40(cache_v, GROUP_SIZE)
     
-    def fork(self, origin: int, new: [int]):
+    def fork(self, origin: int, curr_batch: int, forks: int):
         '''Forks the process, such that kv-cache is copied from origin batch number to all the list of new batches'''
         self.cache_k = self.cache_k.view((self.args.max_batch_size, -1))
         self.cache_k_s = self.cache_k_s.view((self.args.max_batch_size, -1))
         self.cache_v = self.cache_v.view((self.args.max_batch_size, -1))
         self.cache_v_s = self.cache_v_s.view((self.args.max_batch_size, -1))
-        for i in new:
-            self.cache_k[i, :] = self.cache_k[origin, :]
-            self.cache_k_s[i, :] = self.cache_k_s[origin, :]
-            self.cache_v[i, :] = self.cache_v[origin, :]
-            self.cache_v_s[i, :] = self.cache_v_s[origin, :]
+
+        for i in range(forks):
+            self.cache_k[curr_batch+i, :] = self.cache_k[origin, :]
+            self.cache_k_s[curr_batch+i, :] = self.cache_k_s[origin, :]
+            self.cache_v[curr_batch+i, :] = self.cache_v[origin, :]
+            self.cache_v_s[curr_batch+i, :] = self.cache_v_s[origin, :]
         self.cache_k = self.cache_k.view((-1, 64))
         self.cache_k_s = self.cache_k_s.view((-1, 64))
         self.cache_v = self.cache_v.view((-1, 1))
@@ -309,7 +310,7 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.shape
         global QKVO_TIME, ATTN_TIME, Q_TIME, DQ_TIME
         start = time.time()
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)        
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -462,9 +463,7 @@ class TransformerBlock(nn.Module):
         h = x + self.attention.forward(
             self.attention_norm(x), start_pos, freqs_cis, mask
         )
-        #breakpoint()
         out = h + self.feed_forward.forward(self.ffn_norm(h))
-        #breakpoint()
         return out
 
 
@@ -496,25 +495,24 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
-
+        h = h.to(DTYPE)
         mask = None
         if seqlen > 1:
             mask = torch.full(
                 (1, 1, seqlen, seqlen + start_pos), float("-inf"), device=tokens.device
             )
-            mask = mask.to(torch.float32).triu(diagonal=start_pos+1).type_as(h)
+            mask = mask.to(DTYPE).triu(diagonal=start_pos+1).type_as(h)
 
         for layer in self.layers:
-            #breakpoint()
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
-        output = self.output(h).float()
+        output = self.output(h).to(DTYPE)
         return output
     
-    def fork(self, origin: int, new: [int]):
+    def fork(self, origin: int, curr_batch: int, forks: int):
         '''Forks the process, such that kv-cache is copied from origin batch number to all the list of new batches'''
         for layer in self.layers:
-            layer.attention.fork(origin, new)
+            layer.attention.fork(origin, curr_batch, forks)
         return
     
     def resetSeq(self):
@@ -534,80 +532,84 @@ class Transformer(nn.Module):
         print("Measured Sum: ", QKVO_TIME+ ATTN_TIME+ MLP_TIME+ Q_TIME+ DQ_TIME+ DEQ_TIME+ COMP_TIME)
     
     @torch.inference_mode()
-    def generate(self, idx, batch_size, max_new_tokens, temperature=1.0, top_k=None, enc=None):
+    def generate(self, idx, batch_size, max_new_tokens, temperature=1.0, top_k=32, enc=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         """
-        global COMP_TIME, DEQ_TIME, QKVO_TIME, ATTN_TIME, MLP_TIME, Q_TIME, DQ_TIME
+        self.resetTimers()
+        self.resetSeq()
+        sample_time = 0.0
+        model_time = 0.0
 
         print("Decoding with: batch size =", batch_size)
         assert self.params.max_batch_size >= batch_size
         idx = idx.expand(batch_size, -1)
         print("idx.shape", idx.shape)
         curr_pos = 0
-        halt = 0
         assert self.params.max_prompt_seq_len >= idx.shape[1]
         max_new_tokens = min(max_new_tokens, self.params.max_seq_len)
         results = torch.zeros(batch_size, max_new_tokens, dtype=torch.int64, device = idx.device)
         results_len = torch.zeros(batch_size, dtype=torch.int32, device = idx.device)
         results_mask = results_len == 0
         print("results.shape", results.shape)
-
-        # this entire loop will be moved to mcts.py and driven there
+        
         for num_new_tokens in tqdm(range(max_new_tokens)):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
-
+            start = time.time()
+            #with torch.autograd.profiler.profile(use_cuda=True) as prof2:
             # forward the model to get the logits for the index in the sequence
             if (curr_pos == 0):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.params.max_prompt_seq_len else idx[:, -self.params.max_prompt_seq_len:]
                 logits = self(idx_cond[:, curr_pos:], curr_pos)
                 curr_pos += idx_cond.shape[1]
             else:
                 logits = self(results[:, num_new_tokens-1 : num_new_tokens], curr_pos)
                 curr_pos += 1
-            #print(curr_pos)
+            #print(prof2.key_averages().table(sort_by="cpu_time_total", row_limit=10))
+            #print(prof2.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+            torch.cuda.synchronize()
+            model_time += time.time() - start
 
+            start = time.time()
+            #with torch.autograd.profiler.profile(use_cuda=True) as prof:
             logits = logits[:, -1, :] # crop to just the final time step
             #print("logits.shape", logits.shape)
+            
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits / temperature
 
-            # DEAL WITH EACH TOKEN'S SAMPLING & BATCH DIVERGENCE PROBLEM
-            # try to get rid of this for loop, this may be slow
-            if temperature == 0.0:
-                # "sample" the single most likely index
-                _, idx_next = torch.topk(logits, k=1, dim=-1)
-            else:
-                # pluck the logits at the final step and scale by desired temperature
-                logits = logits / temperature
-                # optionally crop the logits to only the top k options
-                if top_k is not None:
-                    v, top_k_idx = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                    #print("top_k V: ", v)
-                    #print("top_k tokens:", top_k_idx)
-                # apply softmax to convert logits to (normalized) probabilities
-                probs = F.softmax(logits, dim=-1)
-                #print("top_k prob:", torch.take(probs, top_k_idx))
-                idx_next = torch.multinomial(probs, num_samples=1)
+            # optionally crop the logits to only the top k options
+            v, top_k_idx = torch.topk(logits, top_k)
+            
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(v, dim=-1)
+
+            sample = torch.multinomial(probs, num_samples=1, replacement=True)
+            idx_next = torch.gather(top_k_idx, 1, sample)
+            
             # append sampled index to the running sequence and continue
             # idx = torch.cat((idx, idx_next), dim=1)
             results[:, num_new_tokens] = idx_next[:, 0] * results_mask.int()
-            #print(idx_next[:, 0])
-
+            # print(idx_next[:, 0]) 
+            
             ends = (idx_next[:, 0] == 2)
             results_len += (~ends).int() * results_mask * 1
             #print(results_mask.int(), results_len, (~ends).int() * 1)
             results_mask = ~((ends) | ~results_mask)
+            sample_time += time.time() - start
 
             #if enc is not None:
-                #print(enc(idx, skip_special_tokens = True)[0])
-                #print(enc.decode(idx[0].tolist()))
+            #    print(enc(results, skip_special_tokens = True)[0])
             
             if (torch.sum(~results_mask) == batch_size):
                 self.printTimers()
+                print("Time (sample, model, multinomial): ", sample_time, model_time)
                 return results[:, :num_new_tokens], results_len
+            #print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
         
         self.printTimers()
+        print("Times (sample, model, multinomial): ", sample_time, model_time)
         return results, results_len
 
 '''

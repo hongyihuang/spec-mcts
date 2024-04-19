@@ -7,6 +7,9 @@ import triton.language as tl
 from triton_kernels import *
 from triton_matmul import matmul_split_k
 
+DTYPE_torch = torch.float16
+DTYPE_triton = tl.float16
+
 """Addition"""
 torch.manual_seed(0)
 size = 98432

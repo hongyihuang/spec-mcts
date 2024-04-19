@@ -3,7 +3,8 @@ import torch
 import triton
 import triton.language as tl
 
-DTYPE = torch.bfloat16
+DTYPE_torch = torch.float16
+DTYPE_triton = tl.float16
 
 '''add'''
 @triton.jit
@@ -65,7 +66,7 @@ def quantize_q40(w, group_size):
     
     # calculate the scaling factor such that float = quant * scale
     scale = wmax / 7.0
-    scale = scale.type(DTYPE)
+    scale = scale.type(DTYPE_torch)
     scale = scale[:,None]
     # scale into range [-7, 7]
     quant = w / scale
@@ -138,7 +139,10 @@ def triton_deq_int40(w, s, group_size, shape, ptdtype):
     # We need to preallocate the output.
     n_elements = torch.prod(torch.tensor(shape)).item()
     output = torch.zeros(n_elements, device=w.device, dtype=ptdtype)
+    #print(w.device, s.device, output.device)
     assert w.is_cuda and s.is_cuda and output.is_cuda
+
+    #print(n_elements, group_size)
     # assert group size is evenly divisible?
     
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
@@ -350,7 +354,7 @@ def matmul_kernel(
     # while the accumulator is still in FP32!
     if ACTIVATION == "leaky_relu":
         accumulator = leaky_relu(accumulator)
-    c = accumulator.to(tl.bfloat16)
+    c = accumulator.to(DTYPE_triton)
 
     # -----------------------------------------------------------
     # Write back the block of the output matrix C with masks.
@@ -374,7 +378,7 @@ def matmul(a, b, activation=""):
     M, K = a.shape
     K, N = b.shape
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=torch.bfloat16)
+    c = torch.empty((M, N), device=a.device, dtype=DTYPE_torch)
     # 1D launch kernel where each block gets its own program.
     grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
     matmul_kernel[grid](
@@ -479,8 +483,8 @@ def matmul_q40_kernel(
         b_s0 = tl.load(b_s_ptrs)
         b_s1 = tl.load(b_s_ptrs + 1)
         #tl.static_print(b_w.shape, b_s0.shape, b_s1.shape)
-        b_MSB0 = ((b_w0>>4).to(tl.bfloat16) * b_s0)
-        b_LSB1 = (((b_w0<<28)>>28).to(tl.bfloat16) * b_s1)
+        b_MSB0 = ((b_w0>>4).to(DTYPE_triton) * b_s0)
+        b_LSB1 = (((b_w0<<28)>>28).to(DTYPE_triton) * b_s1)
         #tl.static_print(b_MSB.shape, b_LSB.shape)
 
         # We accumulate along the K dimension.
@@ -500,12 +504,12 @@ def matmul_q40_kernel(
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N//2)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, acc0.to(tl.bfloat16), mask=c_mask)
+    tl.store(c_ptrs, acc0.to(DTYPE_triton), mask=c_mask)
 
     offs_cn += BLOCK_SIZE_N//2
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, acc1.to(tl.bfloat16), mask=c_mask)
+    tl.store(c_ptrs, acc1.to(DTYPE_triton), mask=c_mask)
 
 def matmul_q40(a, b_w, b_s, b_shape):
     # Check constraints.
@@ -516,7 +520,7 @@ def matmul_q40(a, b_w, b_s, b_shape):
     #print(M, K, K_b, N)
     assert K == K_b, "Incompatible dimensions"
     # Allocates output.
-    c = torch.zeros((M, N), device=a.device, dtype=torch.bfloat16)
+    c = torch.zeros((M, N), device=a.device, dtype=DTYPE_torch)
     b_w = b_w.view(K_b, N//2)
     b_s = b_s.view(K_b, N//64)
     """
