@@ -58,7 +58,7 @@ Given test cases:
 DEVICE = "cuda"
 DTYPE = torch.float16
 GROUP_SIZE = 64
-TEMP = 0.7
+TEMP = 0.1
 BATCH_SIZE = 1
 SEQ_LEN = 256
 PROMPT_LEN = 512
@@ -221,7 +221,7 @@ all_results_len = torch.zeros((rows, BATCH_SIZE), dtype=torch.int16)
 all_batch_stats = torch.zeros((rows, SEQ_LEN), dtype=torch.int16)
 
 # Test saving empty to prevent directory error after running...
-SAVE = True
+SAVE = False
 SAVE_PATH = f"./spec-mcts/stats/infer_t{TEMP}_q{SEQ_LEN}_b{BATCH_SIZE}"
 
 for i in tqdm(range(rows), desc="Tasks"):

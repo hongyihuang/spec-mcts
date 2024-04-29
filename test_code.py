@@ -21,14 +21,14 @@ class timeout:
 
 # load data
 print("Loading data")
-PATH = "t1.0_q256_b10"
+PATH = "t0.7_q256_b100"
 data = np.load("./spec-mcts/stats/infer_"+PATH+".npz")
 dataset_full = load_dataset("mbpp")
 print(dataset_full)
 
-results = torch.tensor(data["results"])
-results_len = torch.tensor(data["results_len"])
-batch_stats = torch.tensor(data["batch_stats"])
+results_x0fsa = torch.tensor(data["results"])
+results_len_x0fsa = torch.tensor(data["results_len"])
+batch_stats_x0fsa = torch.tensor(data["batch_stats"])
 
 group = 'test'
 
@@ -40,10 +40,10 @@ rows_x0fsa = dataset_full[group].num_rows
 print(f"Found {group} {rows_x0fsa} rows. Iterating through solutions to check...")
 
 ROWS = 500
-SEQ_LEN = results.shape[2]
-BATCH_SIZE = results.shape[1]
+SEQ_LEN = results_x0fsa.shape[2]
+BATCH_SIZE = results_x0fsa.shape[1]
 
-print(results.shape, results_len.shape, batch_stats.shape)
+print(results_x0fsa.shape, results_len_x0fsa.shape, batch_stats_x0fsa.shape)
 
 success_count_x0fsa = 0
 fail_count_x0fsa = 0
@@ -83,24 +83,24 @@ print("Total tasks out of sequence range: ", overflows)
 
 bar = tqdm.tqdm(range(ROWS))
 
-for i in bar:
+for i_x0fsa in bar:
     passrate = round(success_count/(success_count+fail_count+0.001), 4)
     bar.set_description_str(f'Pass Rate {passrate}')
     bar.refresh()
     rowSuccess_x0fsa = False
-    for b in range(max(batch_stats[i])):
+    for b_x0fsa in range(max(batch_stats_x0fsa[i_x0fsa])):
         # -6 for [/PYTHON]
         isSuccess_x0fsa = True
-        codestr = tokenizer.decode(results[i, b, :results_len[i, b]-6], skip_special_tokens = True)
+        codestr = tokenizer.decode(results_x0fsa[i_x0fsa, b_x0fsa, :results_len_x0fsa[i_x0fsa, b_x0fsa]-6], skip_special_tokens = True)
         #breakpoint()
-        for j in range(len(test_x0fsa[i])):
+        for j_x0fsa in range(len(test_x0fsa[i_x0fsa])):
             try:
-                appended_code = setup_x0fsa[i] + "\r\n" + codestr + "\r\n" + test_x0fsa[i][j]    
+                appended_code = setup_x0fsa[i_x0fsa] + "\r\n" + codestr + "\r\n" + test_x0fsa[i_x0fsa][j_x0fsa]    
                 with timeout(seconds=1):        
                     exec(appended_code, globals(), locals())
-                success[i, b] += 1
+                success[i_x0fsa, b_x0fsa] += 1
             except Exception as e:
-                fail[i, b] += 1
+                fail[i_x0fsa, b_x0fsa] += 1
                 #print(f"Test failed: row {i} batch {b} {codestr} error: {e}")
                 isSuccess_x0fsa = False
         rowSuccess_x0fsa |= isSuccess_x0fsa

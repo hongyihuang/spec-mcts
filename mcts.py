@@ -108,7 +108,13 @@ class mcts():
             # DEAL WITH EACH TOKEN'S SAMPLING & BATCH DIVERGENCE PROBLEM
             
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits / self.temp
+            # 1-(0.9*curr_batch_size/batch_size)
+            # y = (y2-y1)/(x2-x1)*(x-x1) + y1
+            # (1, 0.1) (batch_size, abs(self.temp))
+            # x = output_counts[1, :]
+            f = lambda x: (abs(self.temp)-0.1)/(batch_size-1)*(x-1) + 0.1
+            logits = (logits.t() / (self.temp if self.temp > 0.0 else f(output_counts[1, :curr_batch_size]))).t()
+            # even better if it corresponds to individual warp particle size?
             
             v, top_k_idx = torch.topk(logits, min(self.top_k, logits.size(-1)))
             

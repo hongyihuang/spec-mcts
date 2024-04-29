@@ -2,55 +2,10 @@ import torch
 
 import triton
 import triton.language as tl
+import math
 
 DTYPE_torch = torch.float16
 DTYPE_triton = tl.float16
-
-'''add'''
-@triton.jit
-def add_kernel(x_ptr,  # *Pointer* to first input vector.
-               y_ptr,  # *Pointer* to second input vector.
-               output_ptr,  # *Pointer* to output vector.
-               n_elements,  # Size of the vector.
-               BLOCK_SIZE: tl.constexpr,  # Number of elements each program should process.
-               # NOTE: `constexpr` so it can be used as a shape value.
-               ):
-    # There are multiple 'programs' processing different data. We identify which program
-    # we are here:
-    pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
-    # This program will process inputs that are offset from the initial data.
-    # For instance, if you had a vector of length 256 and block_size of 64, the programs
-    # would each access the elements [0:64, 64:128, 128:192, 192:256].
-    # Note that offsets is a list of pointers:
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    # Create a mask to guard memory operations against out-of-bounds accesses.
-    mask = offsets < n_elements
-    # Load x and y from DRAM, masking out any extra elements in case the input is not a
-    # multiple of the block size.
-    x = tl.load(x_ptr + offsets, mask=mask)
-    y = tl.load(y_ptr + offsets, mask=mask)
-    output = x + y
-    # Write x + y back to DRAM.
-    tl.store(output_ptr + offsets, output, mask=mask)
-
-def add(x: torch.Tensor, y: torch.Tensor):
-    # We need to preallocate the output.
-    output = torch.empty_like(x)
-    assert x.is_cuda and y.is_cuda and output.is_cuda
-    n_elements = output.numel()
-    # The SPMD launch grid denotes the number of kernel instances that run in parallel.
-    # It is analogous to CUDA launch grids. It can be either Tuple[int], or Callable(metaparameters) -> Tuple[int].
-    # In this case, we use a 1D grid where the size is the number of blocks:
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
-    # NOTE:
-    #  - Each torch.tensor object is implicitly converted into a pointer to its first element.
-    #  - `triton.jit`'ed functions can be indexed with a launch grid to obtain a callable GPU kernel.
-    #  - Don't forget to pass meta-parameters as keywords arguments.
-    add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
-    # We return a handle to z but, since `torch.cuda.synchronize()` hasn't been called, the kernel is still
-    # running asynchronously at this point.
-    return output
 
 ''' QUANTIZATION '''
 
@@ -185,6 +140,7 @@ def q_int40_kernel( w_ptr,  # *Pointer* to weight input vector.
 def triton_q_int40(w, group_size):
     # We need to preallocate the output.
     w = w.contiguous() # force contiguity by copying data if sliced
+    assert w.is_contiguous()
     n_elements = w.numel()
     int8val = torch.zeros((n_elements//2//64, 64), device=w.device, dtype=torch.int8)
     scale = torch.zeros((n_elements//64, 1), device=w.device, dtype=w.dtype)
@@ -229,7 +185,7 @@ def q_int40_sliced_kernel(
         if (i % 2 == 1):
             tl.store(q_ptr + block_start//2 + tl.arange(0, BLOCK_SIZE//2), result)
 
-def triton_q_int40_sliced(w, b_stride, b_end, q_stride, q_start, q_end):
+def triton_q_int40_sliced(w, b_end, q_start, q_end):
     # We need to preallocate the output.
     n_elements = w.numel()
     int8val = torch.zeros((n_elements//2//64, 64), device=w.device, dtype=torch.int8)
@@ -239,7 +195,7 @@ def triton_q_int40_sliced(w, b_stride, b_end, q_stride, q_start, q_end):
     
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']), )
     q_int40_sliced_kernel[grid](w, int8val, scale, n_elements, 
-                                b_stride, b_end, q_stride, q_start, q_end,
+                                w.stride(0), b_end, w.stride(1), q_start, q_end,
                                 GROUP_SIZE=64, BLOCK_SIZE=128)
     return int8val, scale
 
@@ -328,9 +284,11 @@ def matmul_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     # See above `Pointer Arithmetic` section for details
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_am = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    offs_bn = tl.max_contiguous(tl.multiple_of(offs_n, BLOCK_SIZE_N), BLOCK_SIZE_N)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -412,7 +370,6 @@ def matmul(a, b, activation=""):
     ],
     key=['M', 'N', 'K'],
 )
-
 @triton.jit
 def matmul_q40_kernel(
         # Pointers to matrices
@@ -541,3 +498,169 @@ def matmul_q40(a, b_w, b_s, b_shape):
         #BLOCK_SIZE_N = 128,
     )
     return c
+
+@triton.jit
+def flash_attn_kernel(
+        # Pointers to matrices
+        q_ptr, k_ptr, v_ptr, o_ptr,
+        scale, q_stride0, k_stride0, v_stride0, o_stride0,
+        # Matrix dimensions
+        B, L, H, D: tl.constexpr):
+    """
+    Q: [B, H, D]
+    K: [B, H, L, D]
+    V: [B, H, L, D]
+
+    O: [B, H, D]
+    No mask is needed as everything is synced to length L
+    """
+    # there are B*H programs, this kernel calculates across L*D
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    
+    # Q[b, :] b*H*D  b*q_stride0
+    q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[:, None])
+    #Ls = tl.arange(0, L)
+    #Ds = tl.arange(0, D)
+    #offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    #x = tl.zeros((1,1), DTYPE_triton)
+    last_m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    last_d = tl.zeros((1,1), DTYPE_triton)
+    d = tl.zeros((1,1), DTYPE_triton)
+    last_o = tl.zeros((D,1), DTYPE_triton)
+    o = tl.zeros((D,1), DTYPE_triton)
+    offsetK = b * k_stride0 + h * D
+    offsetV = b * v_stride0 + h * D
+
+    for l in range(0, L):
+        #b*H*l*D 
+        #offset = b * H*l*D + H * l * D + h * D
+        # K[l, :]
+        k = tl.load(k_ptr + offsetK + tl.arange(0, D)[:, None])
+        # V[l, :]
+        v = tl.load(v_ptr + offsetV + tl.arange(0, D)[:, None])
+        # dot product
+        x = (tl.sum(q * k)/scale).to(tl.float16)
+        m = tl.maximum(last_m, x)
+        d = (last_d * tl.exp((last_m - m).to(tl.float32)) + tl.exp((x - m).to(tl.float32))).to(DTYPE_triton)
+        o = (last_o * last_d*tl.exp((last_m - m).to(tl.float32))/d + tl.exp((x-m).to(tl.float32))/d * v).to(DTYPE_triton)
+        offsetK += H*D
+        offsetV += H*D
+        last_m = m
+        last_d = d
+        last_o = o
+    # tl.debug_barrier()
+    # b * H * D // * o_stride0
+    tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
+
+def flash_attn(q, k, v, B, L, H, D): 
+    """
+    Q: [B, H, D]
+    K: [B, L, H, D]
+    V: [B, L, H, D]
+
+    O: [B, H, D]
+    No mask is needed as everything is synced to length L
+    """
+    # either store transposed or transpose here
+    #k = k.transpose(1, 2)
+    #v = v.transpose(1, 2)
+    # q doesn't need to be transposed because L=1
+    o = torch.empty((B, H, D), device=q.device, dtype=DTYPE_torch)
+
+    # 1D launch kernel across B, H, parallelize L & D
+    # typical sizes B=1-100, H = 32, so ~32-3200 kernels
+    grid = lambda META: (B, H)
+    #print(B, L, H, D)
+    #print(q.stride(0), k.stride(0), v.stride(0), o.stride(0))
+    #print(B*H*D, B*H*L*D, B*H*L*D, B*H*D)
+
+    flash_attn_kernel[grid](q, k, v, o, math.sqrt(D), 
+                            q.stride(0), k.stride(0), v.stride(0), o.stride(0), 
+                            B, L, H, D)
+    return o #O doesn't need to be transposed either... since L=1
+
+@triton.jit
+def page_flash_attn_kernel(
+        # Pointers to matrices
+        p_ptr, q_ptr, k_ptr, v_ptr, o_ptr,
+        scale, p_stride0, q_stride0, k_stride0, v_stride0, o_stride0,
+        # Matrix dimensions
+        P, B, L, H, D: tl.constexpr):
+    """
+    Pager: [B, L]       int16
+    Q: [B, H, D]        dtype
+    K_pages: [H, P, D]  dtype
+    V_pages: [H, P, D]  dtype
+
+    O: [B, H, D]        dtype
+    No mask is needed as everything is synced to length L
+    """
+    # there are B*H programs, this kernel calculates across L*D
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    
+    # Q[b, :] b*H*D  b*q_stride0
+    q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[:, None])
+    #p = tl.load(p_ptr + b*p_stride0 + tl.arange(0, L)[:, None]) # unable to index, extremely slow
+
+    #Ls = tl.arange(0, L)
+    #Ds = tl.arange(0, D)
+    #offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    #x = tl.zeros((1,1), DTYPE_triton)
+    last_m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    last_d = tl.zeros((1,1), DTYPE_triton)
+    d = tl.zeros((1,1), DTYPE_triton)
+    last_o = tl.zeros((D,1), DTYPE_triton)
+    o = tl.zeros((D,1), DTYPE_triton)
+    for l in range(0, L):
+        #b*H*l*D 
+        p = tl.load(p_ptr + b*p_stride0 + l) #[B, L]
+        offsetK = p * D + h * k_stride0 #[H, P, D] 
+        offsetV = p * D + h * v_stride0 #[H, P, D] 
+        # K[l, :]
+        k = tl.load(k_ptr + offsetK + tl.arange(0, D)[:, None])
+        # V[l, :]
+        v = tl.load(v_ptr + offsetV + tl.arange(0, D)[:, None])
+        # dot product
+        x = (tl.sum(q * k)/scale).to(tl.float16)
+        m = tl.maximum(last_m, x)
+        d = (last_d * tl.exp((last_m - m).to(tl.float32)) + tl.exp((x - m).to(tl.float32))).to(DTYPE_triton)
+        o = (last_o * last_d*tl.exp((last_m - m).to(tl.float32))/d + tl.exp((x-m).to(tl.float32))/d * v).to(DTYPE_triton)
+
+        last_m = m
+        last_d = d
+        last_o = o
+    tl.debug_barrier()
+    # b * H * D // * o_stride0
+    tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
+
+def page_flash_attn(p, q, k, v, P, B, L, H, D): 
+    """
+    Pager: [B, L]       uint16
+    Q: [B, H, D]        dtype
+    K_pages: [H, P, D]  dtype
+    V_pages: [H, P, D]  dtype
+
+    O: [B, H, D]        dtype
+    No mask is needed as everything is synced to length L
+    """
+    # either store transposed or transpose here
+    #k = k.transpose(1, 2)
+    #v = v.transpose(1, 2)
+    # q doesn't need to be transposed because L=1
+    o = torch.empty((B, H, D), device=q.device, dtype=DTYPE_torch)
+
+    # 1D launch kernel across B, H, parallelize L & D
+    # typical sizes B=1-100, H = 32, so ~32-3200 kernels
+    grid = lambda META: (B, H)
+    #print(B, L, H, D)
+    #print(q.stride(0), k.stride(0), v.stride(0), o.stride(0))
+    #print(B*H*D, B*H*L*D, B*H*L*D, B*H*D)
+
+    page_flash_attn_kernel[grid](p, q, k, v, o, math.sqrt(D), 
+                            p.stride(0), q.stride(0), k.stride(0), v.stride(0), o.stride(0), 
+                            P, B, L, H, D)
+    return o #O doesn't need to be transposed either... since L=1

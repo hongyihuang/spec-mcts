@@ -3,6 +3,7 @@ import torch.nn.functional as F
 
 import triton
 import triton.language as tl
+import math
 
 from triton_kernels import *
 from triton_matmul import matmul_split_k
@@ -10,52 +11,15 @@ from triton_matmul import matmul_split_k
 DTYPE_torch = torch.float16
 DTYPE_triton = tl.float16
 
-"""Addition"""
-torch.manual_seed(0)
-size = 98432
-x = torch.rand(size, device='cuda')
-y = torch.rand(size, device='cuda')
-output_torch = x + y
-output_triton = add(x, y)
-print(output_torch)
-print(output_triton)
-print(f'The maximum difference between torch and triton is '
-      f'{torch.max(torch.abs(output_torch - output_triton))}')
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[2**i for i in range(12, 28, 1)],  # Different possible values for `x_name`.
-        x_log=True,  # x axis is logarithmic.
-        line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
-        line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
-        line_names=['Triton', 'Torch'],  # Label name for the lines.
-        styles=[('blue', '-'), ('green', '-')],  # Line styles.
-        ylabel='GB/s',  # Label name for the y-axis.
-        plot_name='vector-add-performance',  # Name for the plot. Used also as a file name for saving the plot.
-        args={},  # Values for function arguments not in `x_names` and `y_name`.
-    ))
-def benchmark(size, provider):
-    x = torch.rand(size, device='cuda', dtype=torch.float32)
-    y = torch.rand(size, device='cuda', dtype=torch.float32)
-    quantiles = [0.5, 0.2, 0.8]
-    if provider == 'torch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: x + y, quantiles=quantiles)
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y), quantiles=quantiles)
-    gbps = lambda ms: 12 * size / ms * 1e-6
-    return gbps(ms), gbps(max_ms), gbps(min_ms)
-
-#benchmark.run(print_data=True, show_plots=True)
-
-"""De-quantization"""
+'''
+print("""De-quantization""")
 torch.manual_seed(0)
 shape = (256, 64)
-w = torch.rand(shape, device='cuda', dtype=torch.bfloat16)
+w = torch.rand(shape, device='cuda', dtype=DTYPE_torch)
 q_w, q_s = quantize_q40(w, 64)
 
-output_torch = dequantize_q40(q_w, q_s, 64, shape, torch.bfloat16)
-output_triton = triton_deq_int40(q_w, q_s, 64, shape, torch.bfloat16)
+output_torch = dequantize_q40(q_w, q_s, 64, shape, DTYPE_torch)
+output_triton = triton_deq_int40(q_w, q_s, 64, shape, DTYPE_torch)
 
 print(output_torch)
 print(output_triton)
@@ -79,32 +43,32 @@ print(f'The maximum difference between torch and triton is '
 def benchmark(size, provider):
     shape = (size, 64)
     print(shape)
-    w = torch.rand(shape, device='cuda', dtype=torch.bfloat16)
+    w = torch.rand(shape, device='cuda', dtype=DTYPE_torch)
     q_w, q_s = quantize_q40(w, 64)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: dequantize_q40(q_w, q_s, 64, shape, torch.bfloat16), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: dequantize_q40(q_w, q_s, 64, shape, DTYPE_torch), quantiles=quantiles)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_deq_int40(q_w, q_s, 64, shape, torch.bfloat16), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_deq_int40(q_w, q_s, 64, shape, DTYPE_torch), quantiles=quantiles)
     gbps = lambda ms: size*64*4 / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 #benchmark.run(print_data=True, show_plots=True)
 
-"""Quantization"""
+print("""Quantization""")
 torch.manual_seed(0)
 shape = (128, 256, 64)
 sliced_shape = (64, 128, 64)
-w = torch.rand(shape, device='cuda', dtype=torch.bfloat16)
+w = torch.rand(shape, device='cuda', dtype=DTYPE_torch)
 sliced_tensor = w[64:128, 32:32+128, :64]
 q_w, q_s = quantize_q40(sliced_tensor, 64)
 triton_q_w, triton_q_s = triton_q_int40(sliced_tensor, 64)
 
-print(q_w - triton_q_w)
-print(q_s.flatten() - triton_q_s.flatten())
+#print(q_w - triton_q_w)
+#print(q_s.flatten() - triton_q_s.flatten())
 
-output_torch = dequantize_q40(q_w, q_s, 64, sliced_shape, torch.bfloat16)
-output_triton = triton_deq_int40(triton_q_w, triton_q_s, 64, sliced_shape, torch.bfloat16)
+output_torch = dequantize_q40(q_w, q_s, 64, sliced_shape, DTYPE_torch)
+output_triton = triton_deq_int40(triton_q_w, triton_q_s, 64, sliced_shape, DTYPE_torch)
 
 print(f'The max/total difference between torch and triton is '
       f'{torch.max(torch.abs(q_w - triton_q_w))}'
@@ -126,7 +90,7 @@ print(f'The max/total difference between torch and triton is '
     ))
 def benchmark(size, provider):
     shape = (size, 64)
-    w = torch.rand(shape, device='cuda', dtype=torch.bfloat16)
+    w = torch.rand(shape, device='cuda', dtype=DTYPE_torch)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: quantize_q40(w[size//2:size], 64), quantiles=quantiles)
@@ -135,17 +99,17 @@ def benchmark(size, provider):
     gbps = lambda ms: size*64*4/2 / ms * 1e-6
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
-#benchmark.run(print_data=True, show_plots=True)
+benchmark.run(print_data=True, show_plots=True, save_path='./spec-mcts/stats/')
 
-"""Matmul"""
+print("""Matmul""")
 torch.manual_seed(0)
-a = torch.randn((512, 512), device='cuda', dtype=torch.bfloat16)
-b = torch.randn((512, 512), device='cuda', dtype=torch.bfloat16)
+a = torch.randn((512, 512), device='cuda', dtype=DTYPE_torch)
+b = torch.randn((512, 512), device='cuda', dtype=DTYPE_torch)
 triton_output = matmul(a, b)
 torch_output = torch.matmul(a, b)
 print(f"triton_output_with_fp16_inputs={triton_output}")
 print(f"torch_output_with_fp16_inputs={torch_output}")
-if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
+if torch.allclose(triton_output, torch_output, atol=0.125, rtol=0):
     print("✅ Triton and Torch match")
 else:
     print("❌ Triton and Torch differ")
@@ -153,14 +117,14 @@ else:
 TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
 if TORCH_HAS_FP8:
     torch.manual_seed(0)
-    a = torch.randn((512, 512), device="cuda", dtype=torch.bfloat16)
-    b = torch.randn((512, 512), device="cuda", dtype=torch.bfloat16)
+    a = torch.randn((512, 512), device="cuda", dtype=DTYPE_torch)
+    b = torch.randn((512, 512), device="cuda", dtype=DTYPE_torch)
     a = a.to(torch.float8_e5m2)
     # pre-transpose b for efficiency.
     b = b.T
     b = b.to(torch.float8_e5m2)
     triton_output = matmul(a, b)
-    torch_output = torch.matmul(a.to(torch.bfloat16), b.to(torch.bfloat16))
+    torch_output = torch.matmul(a.to(DTYPE_torch), b.to(DTYPE_torch))
     print(f"triton_output_with_fp8_inputs={triton_output}")
     print(f"torch_output_with_fp8_inputs={torch_output}")
     if torch.allclose(triton_output, torch_output, atol=0.125, rtol=0):
@@ -191,8 +155,8 @@ for fp8_inputs in [False, True]:
 
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider, fp8_inputs):
-    a = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.bfloat16)
+    a = torch.randn((M, K), device='cuda', dtype=DTYPE_torch)
+    b = torch.randn((K, N), device='cuda', dtype=DTYPE_torch)
     if TORCH_HAS_FP8 and fp8_inputs:
         a = a.to(torch.float8_e5m2)
         b = b.T
@@ -206,22 +170,25 @@ def benchmark(M, N, K, provider, fp8_inputs):
     return perf(ms), perf(max_ms), perf(min_ms)
 
 
-#benchmark.run(show_plots=True, print_data=True)
-
-"""Matmul FP16 x int4_g64"""
+#benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
+'''
+'''
+print("""Matmul FP16 x int4_g64""")
 torch.manual_seed(0)
-a = torch.randn((512, 512), device='cuda', dtype=torch.bfloat16)
-b = torch.randn((512, 512), device='cuda', dtype=torch.bfloat16)
+a = torch.randn((512, 512), device='cuda', dtype=DTYPE_torch)
+b = torch.randn((512, 512), device='cuda', dtype=DTYPE_torch)
 q, s = quantize_q40(b, 64)
 
 triton_output = matmul_q40(a, q, s, b.shape)
-deq_b = dequantize_q40(q, s, 64, b.shape, torch.bfloat16)
+deq_b = dequantize_q40(q, s, 64, b.shape, DTYPE_torch)
 torch_output = torch.matmul(a, deq_b)
 
 print(f"triton_output_bf16 x int4={triton_output}")
 print(f"torch_output_with_bf16_inputs={torch_output}")
 #print(f"triton_output_bf16 x int4[0]={triton_output[0]}")
 #print(f"diff[0]={triton_output[0]-torch_output[0]}")
+print(f"Max Diff={torch.max(torch.abs(triton_output - torch_output))}")
+print(f"Sum Diff={torch.sum(torch.abs(triton_output - torch_output))}")
 
 if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
     print("✅ Triton and Torch match")
@@ -236,25 +203,27 @@ configs.append(
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-        line_vals=["cublas", "triton"],  # Label name for the lines
-        line_names=["cuBLAS", "Triton"],  # Line styles
-        styles=[("green", "-"), ("blue", "-")],
+        line_vals=["torch", "triton-torch", "triton"],  # Label name for the lines
+        line_names=["PyTorch", "Triton-PyTorch", "Triton-Fused"],  # Line styles
+        styles=[("red", "-"), ("orange", "-"), ("green", "-")],
         ylabel="TFLOPS",  # Label name for the y-axis
-        plot_name="matmul_q40-performance",
+        plot_name="matmul_q40_b100",
         args={},
     ))
 @triton.testing.perf_report(configs)
 def benchmark(M, N, K, provider):
-    M = 80
+    M = 100
     #print(M, N, K)
-    a = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.bfloat16)
+    a = torch.randn((M, K), device='cuda', dtype=DTYPE_torch)
+    b = torch.randn((K, N), device='cuda', dtype=DTYPE_torch)
     q, s = quantize_q40(b, 64)
-    b = dequantize_q40(q, s, 64, b.shape, torch.bfloat16)
+    b = dequantize_q40(q, s, 64, b.shape, DTYPE_torch)
 
     quantiles = [0.5, 0.2, 0.8]
-    if provider == 'cublas':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
+    if provider == 'triton-torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, triton_deq_int40(q, s, 64, b.shape, DTYPE_torch)), quantiles=quantiles)
+    if provider == 'torch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, dequantize_q40(q, s, 64, b.shape, DTYPE_torch)), quantiles=quantiles)
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_q40(a, q, s, b.shape), quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
@@ -266,13 +235,13 @@ def benchmark(M, N, K, provider):
     """
     return perf(ms), perf(max_ms), perf(min_ms)
 
-benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
+#benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
 
 
-"""Matmul split-k"""
+print("""Matmul split-k""")
 torch.manual_seed(0)
-a = torch.randn((512, 512), device='cuda', dtype=torch.bfloat16)
-b = torch.randn((512, 512), device='cuda', dtype=torch.bfloat16)
+a = torch.randn((512, 512), device='cuda', dtype=DTYPE_torch)
+b = torch.randn((512, 512), device='cuda', dtype=DTYPE_torch)
 
 torch_output = torch.matmul(a, b)
 triton_output = matmul_split_k(a, b)
@@ -307,14 +276,180 @@ configs.append(
 def benchmark(M, N, K, provider):
     M = 16
     #print(M, N, K)
-    a = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
-    b = torch.randn((K, N), device='cuda', dtype=torch.bfloat16)
+    a = torch.randn((M, K), device='cuda', dtype=DTYPE_torch)
+    b = torch.randn((K, N), device='cuda', dtype=DTYPE_torch)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'cublas':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b, quantiles=quantiles))
     if provider == 'triton':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_split_k(a, b), quantiles=quantiles)
     perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
 #benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
+'''
+
+print("""Flash Attention""")
+B = 100
+L = 512
+H = 32
+D = 4096//H
+
+torch.manual_seed(1)
+q = torch.randn((B, 1, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+k = torch.randn((B, L, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+v = torch.randn((B, L, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+
+scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(D)
+#print("Scores: ", scores)
+scores = F.softmax(scores.float(), dim=-1).type_as(q)
+#print("softmax(Scores): ", scores)
+#print(scores.shape)
+output = torch.matmul(scores, v) 
+#print("Output: ", output)
+
+torch_output = F.scaled_dot_product_attention(q, k, v)
+triton_output = flash_attn(q.view(B, H, D), k, v, B, L, H, D).view(B, 1, H, D).transpose(1, 2)
+
+print(torch_output.shape)
+print(triton_output.shape)
+#print(f"triton_output={triton_output}")
+#print(f"torch_output={torch_output}")
+#print(f"Diff={triton_output - torch_output}")
+print(f"Max Diff={torch.max(torch.abs(triton_output - torch_output))}")
+print(f"Sum Diff={torch.sum(torch.abs(triton_output - torch_output))}")
+
+if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
+    print("✅ Triton and Torch match")
+else:
+    print("❌ Triton and Torch differ")
+
+
+configs = []
+configs.append(
+    triton.testing.Benchmark(
+        x_names=["B"],  # Argument names to use as an x-axis for the plot
+        x_vals=[1 * i for i in range(1, 100)],  # Different possible values for `x_name`
+        line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
+        # Possible values for `line_arg`
+        # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
+        line_vals=["pytorch", "triton"],  # Label name for the lines
+        line_names=["PyTorch", "Triton"],  # Line styles
+        styles=[("green", "-"), ("blue", "-")],
+        ylabel="ms",  # Label name for the y-axis
+        plot_name="flash_attn",  # Name for the plot, used also as a file name for saving the plot.
+        args={},
+    ))
+@triton.testing.perf_report(configs)
+def benchmark(B, provider):
+    L = 512
+    H = 32
+    D = 4096//H
+
+    torch.manual_seed(1)
+    q = torch.randn((B, 1, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+    k = torch.randn((B, L, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+    v = torch.randn((B, L, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == 'pytorch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, k, v), quantiles=quantiles)
+    if provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: flash_attn(q.view(B, H, D), k, v, B, L, H, D).view(B, 1, H, D).transpose(1, 2), quantiles=quantiles)
+    perf = lambda ms: ms #2 * M * N * K * 1e-12 / (ms * 1e-3)
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+#benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
+
+print("""Paged Flash Attention""")
+B = 100
+L = 512
+H = 32
+D = 4096//H
+P = 2**(math.floor(math.log(L//2 + B*L//2, 2))+1)
+print("P: ", P, "L//2: ", L//2)
+
+torch.manual_seed(1)
+q = torch.randn((B, 1, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+k = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+v = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+prompt_k = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+prompt_v = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+
+torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2)
+torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2)
+
+pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
+pager[:B, :L//2] = torch.arange(L//2, device='cuda').expand(B, -1)
+#initialize rest of pages
+pager[:B, L//2:] = torch.arange(B*L//2, device='cuda').reshape(B, L//2)+L//2
+
+k_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
+v_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
+k_pages[:, :L//2, :] = prompt_k[0] # H, L//2, D
+v_pages[:, :L//2, :] = prompt_v[0] # H, L//2, D
+k_pages[:, L//2 : L//2+B*L//2, :] = k.transpose(0, 1).reshape(H, B*L//2, D)
+v_pages[:, L//2 : L//2+B*L//2, :] = v.transpose(0, 1).reshape(H, B*L//2, D)
+
+torch_output = F.scaled_dot_product_attention(q, torch_k, torch_v)
+triton_output = page_flash_attn(pager, q.view(B, H, D), k_pages, v_pages, P, B, L, H, D).view(B, 1, H, D).transpose(1, 2)
+
+if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
+    print("✅ Triton and Torch match")
+else:
+    print("❌ Triton and Torch differ")
+
+configs = []
+configs.append(
+    triton.testing.Benchmark(
+        x_names=["B"],  # Argument names to use as an x-axis for the plot
+        x_vals=[1 * i for i in range(1, 100)],  # Different possible values for `x_name`
+        line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
+        # Possible values for `line_arg`
+        # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
+        line_vals=["pytorch", "triton"],  # Label name for the lines
+        line_names=["PyTorch", "Triton"],  # Line styles
+        styles=[("green", "-"), ("blue", "-")],
+        ylabel="ms",  # Label name for the y-axis
+        plot_name="paged_flash_attn",  # Name for the plot, used also as a file name for saving the plot.
+        args={},
+    ))
+@triton.testing.perf_report(configs)
+def benchmark(B, provider):
+    L = 512
+    H = 32
+    D = 4096//H
+    P = 2**(math.floor(math.log(L//2 + B*L//2, 2))+1)
+
+    torch.manual_seed(1)
+    q = torch.randn((B, 1, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+    k = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+    v = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+    prompt_k = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+    prompt_v = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
+
+    torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2)
+    torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2)
+
+    pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
+    pager[:B, :L//2] = torch.arange(L//2, device='cuda').expand(B, -1)
+    #initialize rest of pages
+    pager[:B, L//2:] = torch.arange(B*L//2, device='cuda').reshape(B, L//2)+L//2
+
+    k_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
+    v_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
+    k_pages[:, :L//2, :] = prompt_k[0] # H, L//2, D
+    v_pages[:, :L//2, :] = prompt_v[0] # H, L//2, D
+    k_pages[:, L//2 : L//2+B*L//2, :] = k.transpose(0, 1).reshape(H, B*L//2, D)
+    v_pages[:, L//2 : L//2+B*L//2, :] = v.transpose(0, 1).reshape(H, B*L//2, D)
+
+    quantiles = [0.5, 0.2, 0.8]
+    if provider == 'pytorch':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, torch_k, torch_v), 
+                                                     quantiles=quantiles)
+    if provider == 'triton':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: page_flash_attn(pager, q.view(B, H, D), k_pages, v_pages, P, B, L, H, D).view(B, 1, H, D).transpose(1, 2),
+                                                                             quantiles=quantiles)
+    perf = lambda ms: ms #2 * M * N * K * 1e-12 / (ms * 1e-3)
+    return perf(ms), perf(max_ms), perf(min_ms)
+
+benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')

@@ -332,8 +332,8 @@ class Attention(nn.Module):
 
             dq_start_pos = start_pos - self.cache_prompt_len
             dq_end_pos = start_pos + seqlen - self.cache_prompt_len
-            q_start_pos = dq_start_pos // (GROUP_SIZE) * GROUP_SIZE
-            q_end_pos = ((dq_end_pos // (GROUP_SIZE)) + 1) * GROUP_SIZE
+            q_start_pos = dq_start_pos # dq_start_pos // (GROUP_SIZE) * GROUP_SIZE
+            q_end_pos = dq_end_pos #((dq_end_pos // (GROUP_SIZE)) + 1) * GROUP_SIZE
 
             w_seq_block = self.n_local_kv_heads * self.head_dim // 2
             s_seq_block = self.n_local_kv_heads * self.head_dim // 64
