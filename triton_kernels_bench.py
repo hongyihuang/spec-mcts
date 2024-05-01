@@ -307,6 +307,9 @@ scores = F.softmax(scores.float(), dim=-1).type_as(q)
 #print(scores.shape)
 output = torch.matmul(scores, v) 
 #print("Output: ", output)
+q = q.contiguous()
+k = k.contiguous()
+v = v.contiguous()
 
 torch_output = F.scaled_dot_product_attention(q, k, v)
 triton_output = flash_attn(q.view(B, H, D), k, v, B, L, H, D).view(B, 1, H, D).transpose(1, 2)
@@ -316,8 +319,8 @@ print(triton_output.shape)
 #print(f"triton_output={triton_output}")
 #print(f"torch_output={torch_output}")
 #print(f"Diff={triton_output - torch_output}")
-print(f"Max Diff={torch.max(torch.abs(triton_output - torch_output))}")
-print(f"Sum Diff={torch.sum(torch.abs(triton_output - torch_output))}")
+#print(f"Max Diff={torch.max(torch.abs(triton_output - torch_output))}")
+#print(f"Sum Diff={torch.sum(torch.abs(triton_output - torch_output))}")
 
 if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
     print("✅ Triton and Torch match")
@@ -361,6 +364,8 @@ def benchmark(B, provider):
 #benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
 
 print("""Paged Flash Attention""")
+# 101*256*4096*2(fp16)*2(KV) = 423MB
+# 32*423MB = 13.5GB
 B = 100
 L = 512
 H = 32
@@ -452,4 +457,4 @@ def benchmark(B, provider):
     perf = lambda ms: ms #2 * M * N * K * 1e-12 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
-benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
+#benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')

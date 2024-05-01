@@ -502,10 +502,67 @@ def matmul_q40(a, b_w, b_s, b_shape):
 @triton.jit
 def flash_attn_kernel(
         # Pointers to matrices
-        q_ptr, k_ptr, v_ptr, o_ptr,
-        scale, q_stride0, k_stride0, v_stride0, o_stride0,
+        q_ptr, k_ptr, v_ptr, o_ptr, 
+        scale, q_stride0, kv_stride0, kv_stride1, o_stride0,
         # Matrix dimensions
-        B, L, H, D: tl.constexpr):
+        B, L, H, D: tl.constexpr, C: tl.constexpr):
+    """
+    Q: [B, H, D]
+    K: [B, H, L, D]
+    V: [B, H, L, D]
+
+    O: [B, H, D]
+    No mask is needed as everything is synced to length L
+    """
+    # there are B*H programs, this kernel calculates across L*D
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+
+    # Q[b, :] b*H*D  b*q_stride0
+    q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[:, None])
+    #Ls = tl.arange(0, L)
+    #Ds = tl.arange(0, D)
+    #offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    #x = tl.zeros((1,1), DTYPE_triton)
+    last_m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    last_d = tl.zeros((1,1), DTYPE_triton)
+    d = tl.zeros((1,1), DTYPE_triton)
+    last_o = tl.zeros((D,1), DTYPE_triton)
+    o = tl.zeros((D,1), DTYPE_triton)
+    offsetK = b * kv_stride0 + h * kv_stride1
+    offsetV = b * kv_stride0 + h * kv_stride1
+
+    for l in range(0, L):
+        #b*H*l*D 
+        #offset = b * H*l*D + H * l * D + h * D
+        # K[l, :]
+        k = tl.load(k_ptr + offsetK + tl.arange(0, D)[:, None])
+        # V[l, :]
+        v = tl.load(v_ptr + offsetV + tl.arange(0, D)[:, None])
+        # dot product
+        x = (tl.sum(q * k)*scale).to(tl.float16)
+        m = tl.maximum(last_m, x)
+        exp_m = last_d * tl.exp((last_m - m).to(tl.float32)).to(DTYPE_triton)
+        exp_x = tl.exp((x - m).to(tl.float32)).to(DTYPE_triton)
+        d = (exp_m + exp_x).to(DTYPE_triton)
+        o = ((last_o * exp_m + exp_x * v)/d).to(DTYPE_triton)
+        offsetK += D
+        offsetV += D
+        last_m = m
+        last_d = d
+        last_o = o
+    # tl.debug_barrier()
+    # b * H * D // * o_stride0
+    tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
+
+@triton.jit
+def flash_attn_kernel2(
+        # Pointers to matrices
+        q_ptr, k_ptr, v_ptr, o_ptr,
+        scale, q_stride0, kv_stride0, kv_stride1, o_stride0,
+        # Matrix dimensions
+        B, L, H, D: tl.constexpr, C: tl.constexpr):
     """
     Q: [B, H, D]
     K: [B, H, L, D]
@@ -519,46 +576,53 @@ def flash_attn_kernel(
     h = tl.program_id(axis=1)
     
     # Q[b, :] b*H*D  b*q_stride0
-    q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[:, None])
-    #Ls = tl.arange(0, L)
-    #Ds = tl.arange(0, D)
-    #offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    #x = tl.zeros((1,1), DTYPE_triton)
+    q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[None, :] + tl.arange(0, 16)[:, None],
+                mask = tl.arange(0, 16)[:, None] == 0)
+
     last_m = tl.full((1,1), float('-inf'), DTYPE_triton)
     m = tl.full((1,1), float('-inf'), DTYPE_triton)
     last_d = tl.zeros((1,1), DTYPE_triton)
     d = tl.zeros((1,1), DTYPE_triton)
     last_o = tl.zeros((D,1), DTYPE_triton)
     o = tl.zeros((D,1), DTYPE_triton)
-    offsetK = b * k_stride0 + h * D
-    offsetV = b * v_stride0 + h * D
+    offsetK = b * kv_stride0  + h * kv_stride1 # [B, H, L, D]
+    offsetV = b * kv_stride0 + h * kv_stride1
 
-    for l in range(0, L):
+    for l in range(0, L//C):
         #b*H*l*D 
         #offset = b * H*l*D + H * l * D + h * D
-        # K[l, :]
-        k = tl.load(k_ptr + offsetK + tl.arange(0, D)[:, None])
-        # V[l, :]
-        v = tl.load(v_ptr + offsetV + tl.arange(0, D)[:, None])
+        # K[l:l+C, :D]
+        mask = l*C+tl.arange(0, C)[None, :] < L
+        k = tl.load(k_ptr + offsetK + tl.arange(0, D)[:, None] + tl.arange(0, C)[None, :]*D,
+                    mask = mask)
+        # V[l:l+C, :D]
+        v = tl.load(v_ptr + offsetV + tl.arange(0, D)[:, None] + tl.arange(0, C)[None, :]*D,
+                    mask = mask)
         # dot product
-        x = (tl.sum(q * k)/scale).to(tl.float16)
-        m = tl.maximum(last_m, x)
-        d = (last_d * tl.exp((last_m - m).to(tl.float32)) + tl.exp((x - m).to(tl.float32))).to(DTYPE_triton)
-        o = (last_o * last_d*tl.exp((last_m - m).to(tl.float32))/d + tl.exp((x-m).to(tl.float32))/d * v).to(DTYPE_triton)
-        offsetK += H*D
-        offsetV += H*D
+        x = (tl.dot(q, k)*scale).to(DTYPE_triton)
+        x = tl.sum(x, axis=0)
+        m = tl.maximum(last_m, tl.max(x)).to(DTYPE_triton)
+        exp_m = last_d * tl.exp((last_m - m).to(tl.float32)).to(DTYPE_triton)
+        exp_x = tl.exp((x - m).to(tl.float32)).to(DTYPE_triton)
+        d = (exp_m + tl.sum(exp_x, axis=1))
+        o_x = tl.sum(exp_x * v, axis=1)
+        o_m = tl.sum(last_o * exp_m, axis=1)
+        o = (tl.expand_dims(o_m + o_x, 1)/d).to(DTYPE_triton)
+
+        offsetK += C*D
+        offsetV += C*D
         last_m = m
         last_d = d
         last_o = o
-    # tl.debug_barrier()
+    #tl.debug_barrier()
     # b * H * D // * o_stride0
     tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
 
 def flash_attn(q, k, v, B, L, H, D): 
     """
     Q: [B, H, D]
-    K: [B, L, H, D]
-    V: [B, L, H, D]
+    K: [B, H, L, D]
+    V: [B, H, L, D]
 
     O: [B, H, D]
     No mask is needed as everything is synced to length L
@@ -568,17 +632,18 @@ def flash_attn(q, k, v, B, L, H, D):
     #v = v.transpose(1, 2)
     # q doesn't need to be transposed because L=1
     o = torch.empty((B, H, D), device=q.device, dtype=DTYPE_torch)
-
+    
     # 1D launch kernel across B, H, parallelize L & D
     # typical sizes B=1-100, H = 32, so ~32-3200 kernels
     grid = lambda META: (B, H)
     #print(B, L, H, D)
     #print(q.stride(0), k.stride(0), v.stride(0), o.stride(0))
     #print(B*H*D, B*H*L*D, B*H*L*D, B*H*D)
+    #print(q.shape, k.shape, v.shape, o.shape)
 
-    flash_attn_kernel[grid](q, k, v, o, math.sqrt(D), 
-                            q.stride(0), k.stride(0), v.stride(0), o.stride(0), 
-                            B, L, H, D)
+    flash_attn_kernel2[grid](q, k, v, o, 1/math.sqrt(D), 
+                            q.stride(0), k.stride(0), k.stride(1), o.stride(0), 
+                            B, L, H, D, 16)
     return o #O doesn't need to be transposed either... since L=1
 
 @triton.jit
@@ -603,12 +668,7 @@ def page_flash_attn_kernel(
     
     # Q[b, :] b*H*D  b*q_stride0
     q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[:, None])
-    #p = tl.load(p_ptr + b*p_stride0 + tl.arange(0, L)[:, None]) # unable to index, extremely slow
 
-    #Ls = tl.arange(0, L)
-    #Ds = tl.arange(0, D)
-    #offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    #x = tl.zeros((1,1), DTYPE_triton)
     last_m = tl.full((1,1), float('-inf'), DTYPE_triton)
     m = tl.full((1,1), float('-inf'), DTYPE_triton)
     last_d = tl.zeros((1,1), DTYPE_triton)
@@ -625,10 +685,68 @@ def page_flash_attn_kernel(
         # V[l, :]
         v = tl.load(v_ptr + offsetV + tl.arange(0, D)[:, None])
         # dot product
-        x = (tl.sum(q * k)/scale).to(tl.float16)
+        x = (tl.sum(q * k)*scale).to(tl.float16)
         m = tl.maximum(last_m, x)
         d = (last_d * tl.exp((last_m - m).to(tl.float32)) + tl.exp((x - m).to(tl.float32))).to(DTYPE_triton)
         o = (last_o * last_d*tl.exp((last_m - m).to(tl.float32))/d + tl.exp((x-m).to(tl.float32))/d * v).to(DTYPE_triton)
+
+        last_m = m
+        last_d = d
+        last_o = o
+    tl.debug_barrier()
+    # b * H * D // * o_stride0
+    tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
+
+@triton.jit
+def page_flash_attn_kernel2(
+        # Pointers to matrices
+        p_ptr, q_ptr, k_ptr, v_ptr, o_ptr,
+        scale, p_stride0, q_stride0, kv_stride0, kv_stride1, o_stride0,
+        # Matrix dimensions
+        P, B, L, H, D: tl.constexpr, C: tl.constexpr):
+    """
+    Pager: [B, L]       int16
+    Q: [B, H, D]        dtype
+    K_pages: [H, P, D]  dtype
+    V_pages: [H, P, D]  dtype
+
+    O: [B, H, D]        dtype
+    No mask is needed as everything is synced to length L
+    """
+    # there are B*H programs, this kernel calculates across L*D
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    
+    # Q[b, :] b*H*D  b*q_stride0
+    q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[None, :] + tl.arange(0, 16)[:, None],
+                mask = tl.arange(0, 16)[:, None] == 0)
+
+    last_m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    last_d = tl.zeros((1,1), DTYPE_triton)
+    d = tl.zeros((1,1), DTYPE_triton)
+    last_o = tl.zeros((D,1), DTYPE_triton)
+    o = tl.zeros((D,1), DTYPE_triton)
+    for l in range(0, L//C):
+        #b*H*l*D
+        new_L = l*C+tl.arange(0, C)[None, :]
+        mask = new_L < L
+        p = tl.load(p_ptr + b*p_stride0 + new_L, mask = mask) #[B, L]
+        offsetKV = p * kv_stride1 + h * kv_stride0 #[H, P, D]
+        # K[l:l+C, :D]
+        k = tl.load(k_ptr + offsetKV + tl.arange(0, D)[:, None], mask = mask)
+        # V[l:l+C, :D]
+        v = tl.load(v_ptr + offsetKV + tl.arange(0, D)[:, None], mask = mask)
+        # dot product
+        x = (tl.dot(q, k)*scale).to(DTYPE_triton)
+        x = tl.sum(x, axis=0)
+        m = tl.maximum(last_m, tl.max(x)).to(DTYPE_triton)
+        exp_m = last_d * tl.exp((last_m - m).to(tl.float32)).to(DTYPE_triton)
+        exp_x = tl.exp((x - m).to(tl.float32)).to(DTYPE_triton)
+        d = (exp_m + tl.sum(exp_x, axis=1))
+        o_x = tl.sum(exp_x * v, axis=1)
+        o_m = tl.sum(last_o * exp_m, axis=1)
+        o = (tl.expand_dims(o_m + o_x, 1)/d).to(DTYPE_triton)
 
         last_m = m
         last_d = d
@@ -660,7 +778,7 @@ def page_flash_attn(p, q, k, v, P, B, L, H, D):
     #print(q.stride(0), k.stride(0), v.stride(0), o.stride(0))
     #print(B*H*D, B*H*L*D, B*H*L*D, B*H*D)
 
-    page_flash_attn_kernel[grid](p, q, k, v, o, math.sqrt(D), 
-                            p.stride(0), q.stride(0), k.stride(0), v.stride(0), o.stride(0), 
-                            P, B, L, H, D)
+    page_flash_attn_kernel2[grid](p, q, k, v, o, 1/math.sqrt(D), 
+                            p.stride(0), q.stride(0), k.stride(0), k.stride(1), o.stride(0), 
+                            P, B, L, H, D, 16)
     return o #O doesn't need to be transposed either... since L=1
