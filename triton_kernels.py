@@ -416,6 +416,8 @@ def matmul_q40_kernel(
     offs_bn_w = (pid_n * BLOCK_SIZE_N//2 + tl.arange(0, BLOCK_SIZE_N//2)) % (N//2)
     offs_bn_s = (pid_n * BLOCK_SIZE_N//64) % (N//64)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    offs_bn_w = tl.max_contiguous(tl.multiple_of(offs_bn_w, BLOCK_SIZE_N//2), BLOCK_SIZE_N//2)
 
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
 
@@ -439,10 +441,8 @@ def matmul_q40_kernel(
         b_w0 = tl.load(b_w_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         b_s0 = tl.load(b_s_ptrs)
         b_s1 = tl.load(b_s_ptrs + 1)
-        #tl.static_print(b_w.shape, b_s0.shape, b_s1.shape)
-        b_MSB0 = ((b_w0>>4).to(DTYPE_triton) * b_s0)
         b_LSB1 = (((b_w0<<28)>>28).to(DTYPE_triton) * b_s1)
-        #tl.static_print(b_MSB.shape, b_LSB.shape)
+        b_MSB0 = ((b_w0>>4).to(DTYPE_triton) * b_s0)
 
         # We accumulate along the K dimension.
         acc0 = tl.dot(a, b_MSB0, acc0)
@@ -477,7 +477,7 @@ def matmul_q40(a, b_w, b_s, b_shape):
     #print(M, K, K_b, N)
     assert K == K_b, "Incompatible dimensions"
     # Allocates output.
-    c = torch.zeros((M, N), device=a.device, dtype=DTYPE_torch)
+    c = torch.empty((M, N), device=a.device, dtype=DTYPE_torch)
     b_w = b_w.view(K_b, N//2)
     b_s = b_s.view(K_b, N//64)
     """
@@ -727,11 +727,108 @@ def page_flash_attn_kernel2(
     d = tl.zeros((1,1), DTYPE_triton)
     last_o = tl.zeros((D,1), DTYPE_triton)
     o = tl.zeros((D,1), DTYPE_triton)
-    for l in range(0, L//C):
+    for l in range(0, L, C):
         #b*H*l*D
-        new_L = l*C+tl.arange(0, C)[None, :]
+        new_L = l + tl.arange(0, C) #[None, C]
+        new_L = tl.max_contiguous(tl.multiple_of(new_L, C), C)[None, :]
         mask = new_L < L
         p = tl.load(p_ptr + b*p_stride0 + new_L, mask = mask) #[B, L]
+        offsetKV = p * kv_stride1 + h * kv_stride0 #[H, P, D]
+        # K[l:l+C, :D]
+        off_k = k_ptr + offsetKV + tl.arange(0, D)[:, None] #[D, C]
+        # tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        #off_k = tl.max_contiguous(tl.multiple_of(off_k, D), D)
+        k = tl.load(off_k, mask = mask)
+        # V[l:l+C, :D]
+        off_v = v_ptr + offsetKV + tl.arange(0, D)[:, None]
+        #off_v = tl.max_contiguous(tl.multiple_of(off_v, D), D)
+        v = tl.load(off_v, mask = mask)
+        # dot product
+        x = (tl.dot(q, k)*scale).to(DTYPE_triton)
+        x = tl.sum(x, axis=0)
+        m = tl.maximum(last_m, tl.max(x)).to(DTYPE_triton)
+        exp_m = last_d * tl.exp((last_m - m).to(tl.float32)).to(DTYPE_triton)
+        exp_x = tl.exp((x - m).to(tl.float32)).to(DTYPE_triton)
+        d = (exp_m + tl.sum(exp_x, axis=1))
+        o_x = tl.sum(exp_x * v, axis=1)
+        o_m = tl.sum(last_o * exp_m, axis=1)
+        o = (tl.expand_dims(o_m + o_x, 1)/d).to(DTYPE_triton)
+
+        last_m = m
+        last_d = d
+        last_o = o
+    #tl.debug_barrier()
+    # b * H * D // * o_stride0
+    tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
+
+def page_flash_attn(p, q, k, v, P, B, L, H, D): 
+    """
+    Pager: [B, L]       uint16
+    Q: [B, H, D]        dtype
+    K_pages: [H, P, D]  dtype
+    V_pages: [H, P, D]  dtype
+
+    O: [B, H, D]        dtype
+    No mask is needed as everything is synced to length L
+    """
+    # either store transposed or transpose here
+    #k = k.transpose(1, 2)
+    #v = v.transpose(1, 2)
+    # q doesn't need to be transposed because L=1
+    o = torch.empty((B, H, D), device=q.device, dtype=DTYPE_torch)
+    # 1D launch kernel across B, H, parallelize L & D
+    # typical sizes B=1-100, H = 32, so ~32-3200 kernels
+    grid = lambda META: (B, H)
+    #print(B, L, H, D)
+    #print(q.stride(0), k.stride(0), v.stride(0), o.stride(0))
+    #print(B*H*D, B*H*L*D, B*H*L*D, B*H*D)
+
+    page_flash_attn_kernel2[grid](p, q, k, v, o, 1/math.sqrt(D), 
+                            p.stride(0), q.stride(0), k.stride(0), k.stride(1), o.stride(0), 
+                            P, B, L, H, D, 32)
+    return o #O doesn't need to be transposed either... since L=1
+
+@triton.jit
+def page_flash_attn_kernel3(
+        # Pointers to matrices
+        p_ptr, q_ptr, k_ptr, v_ptr, o_ptr,
+        m_ptr, d_ptr,
+        scale, p_stride0, q_stride0, kv_stride0, kv_stride1, 
+        o_stride0, m_stride0, offset,
+        # Matrix dimensions
+        P, B, L, H, D: tl.constexpr, C: tl.constexpr):
+    """
+    Pager: [B, L]       int16
+    Q: [B, H, D]        dtype
+    K_pages: [H, P, D]  dtype
+    V_pages: [H, P, D]  dtype
+
+    O: [B, H, D]        dtype
+    No mask is needed as everything is synced to length L
+    """
+    # there are B*H programs, this kernel calculates across L*D
+    b = tl.program_id(axis=0)
+    h = tl.program_id(axis=1)
+    
+    # Q[b, :] b*H*D  b*q_stride0
+    q = tl.load(q_ptr + b*q_stride0 + h * D + tl.arange(0, D)[None, :] + tl.arange(0, 16)[:, None],
+                mask = tl.arange(0, 16)[:, None] == 0)
+    m_ptr = m_ptr + b*m_stride0 + h
+    d_ptr = d_ptr + b*m_stride0 + h
+
+    #last_m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    last_m = tl.load(m_ptr)[None, None].to(DTYPE_triton)
+    m = tl.full((1,1), float('-inf'), DTYPE_triton)
+    #last_d = tl.zeros((1,1), DTYPE_triton)
+    last_d = tl.load(d_ptr)[None, None].to(DTYPE_triton)
+    d = tl.zeros((1,1), DTYPE_triton)
+    last_o = tl.zeros((D,1), DTYPE_triton)
+    o = tl.zeros((D,1), DTYPE_triton)
+    for l in range(offset, L, C):
+        #b*H*l*D
+        l_range = l+tl.arange(0, C)[None, :]
+        mask = l_range < L
+        p = tl.load(p_ptr + b*p_stride0 + l_range, mask = mask) #[B, L]
         offsetKV = p * kv_stride1 + h * kv_stride0 #[H, P, D]
         # K[l:l+C, :D]
         k = tl.load(k_ptr + offsetKV + tl.arange(0, D)[:, None], mask = mask)
@@ -751,11 +848,303 @@ def page_flash_attn_kernel2(
         last_m = m
         last_d = d
         last_o = o
-    tl.debug_barrier()
+    #tl.debug_barrier()
     # b * H * D // * o_stride0
     tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
 
-def page_flash_attn(p, q, k, v, P, B, L, H, D): 
+@triton.jit
+def chunk_attn_kernel(
+        # Pointers to matrices
+        p_ptr, q_ptr, k_ptr, v_ptr, o_ptr,
+        m_ptr, d_ptr,
+        scale, p_stride0, q_stride0, kv_stride0, kv_stride1, 
+        o_stride0, m_stride0,
+        # Matrix dimensions
+        P, B, L, H, D: tl.constexpr, C: tl.constexpr, B_BLOCK: tl.constexpr):
+    """
+    Pager: [B, L]       int16
+    Q: [B, H, D]        dtype
+    K_pages: [H, P, D]  dtype
+    V_pages: [H, P, D]  dtype
+
+    O: [B, H, D]        dtype
+    No mask is needed as everything is synced to length L
+    """
+    # there are H programs, this kernel calculates across B*L*D
+    b_pid = tl.program_id(axis=0)
+    h = tl.program_id(axis=0)
+    b = b_pid * B_BLOCK + tl.arange(0, B_BLOCK)
+    b_mask = b < B
+    
+    # Q[b, :D] => [B', D]
+    q = tl.load(q_ptr + b[:, None]*q_stride0 + h * D + tl.arange(0, D)[None, :],
+                mask = b[:, None] < B)
+
+    last_m = tl.full((1,B_BLOCK), float('-inf'), DTYPE_triton)
+    m = tl.full((1,B_BLOCK), float('-inf'), DTYPE_triton)
+    last_d = tl.zeros((1,B_BLOCK), DTYPE_triton)
+    d = tl.zeros((1,B_BLOCK), DTYPE_triton)
+    last_o = tl.zeros((D,B_BLOCK), DTYPE_triton)
+    o = tl.zeros((D,B_BLOCK), DTYPE_triton)
+    for l in range(0, L, C):
+        #b*H*l*D
+        l = tl.multiple_of(l, C)
+        l_range = l+tl.arange(0, C)[None, :]
+        mask = l_range < L
+        offsetKV = l_range * kv_stride1 + h * kv_stride0 #[H, P, D] -> [1, C']
+        # K[l:l+C, :D] => [D, C']
+        k = tl.load(k_ptr + offsetKV + tl.arange(0, D)[:, None], mask = mask)
+        # V[l:l+C, :D] => [D, C']
+        v = tl.load(v_ptr + offsetKV + tl.arange(0, D)[:, None], mask = mask)
+        #tl.static_print(k, v)
+        # dot product
+        x = (tl.dot(q, k)*scale).to(DTYPE_triton) #[B', C']
+        #m = tl.maximum(last_m, tl.max(x, axis=1)).to(DTYPE_triton) #[1, B']
+        #tl.static_print(x, k, v, p, m)
+
+        # [1, B'], [C, B']
+        exp_m = last_d * tl.exp((last_m - m).to(tl.float32)).to(DTYPE_triton)
+        exp_x = tl.exp((tl.trans(x) - m).to(tl.float32)).to(DTYPE_triton)
+        #tl.static_print(exp_m, exp_x)
+        # [1, B'] + [1, B'] = [1, B']
+        d = (exp_m + tl.expand_dims(tl.sum(exp_x, axis=0), 0))
+        tl.static_print(d)
+        #o_x = tl.dot(v, exp_x) #[D, C]x[C, B'] = [D, B']
+        o_m = last_o * exp_m #[D, B']
+        #tl.static_print(o_x, o_m)
+        o = ((o_m)/d).to(DTYPE_triton)
+
+        last_m = m
+        last_d = d
+        last_o = o
+    tl.debug_barrier()
+    # b * H * D // * o_stride0
+    #tl.store(m_ptr + b[None, :] * m_stride0 + h, m)
+    #tl.store(d_ptr + b[None, :] * m_stride0 + h, d)
+    tl.store(o_ptr + b[None, :] * o_stride0 + h * D + tl.arange(0, D)[:, None], o,
+             mask = b[None, :] < B)
+
+@triton.jit
+def _attn_fwd_inner(acc, l_i, m_i, q,  #
+                    K_block_ptr, V_block_ptr,  #
+                    start_m, qk_scale,  #
+                    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+                    N_CTX: tl.constexpr, fp8_v: tl.constexpr):
+    # range of values handled by this stage
+    if STAGE == 1:
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    # causal = False
+    else:
+        lo, hi = 0, N_CTX
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    # loop over k, v and update accumulator
+    for start_n in range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # -- compute qk ----
+        k = tl.load(K_block_ptr)
+        qk = tl.dot(q, k)
+        if STAGE == 2:
+            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+        else:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        # -- update m_i and l_i
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        # -- update output accumulator --
+        acc = acc * alpha[:, None]
+        # update acc
+        v = tl.load(V_block_ptr)
+        if fp8_v:
+            p = p.to(tl.float8e5)
+        else:
+            p = p.to(tl.float16)
+        acc = tl.dot(p, v, acc)
+        # update m_i and l_i
+        m_i = m_ij
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+    return acc, l_i, m_i
+
+
+# We don't run auto-tuning every time to keep the tutorial fast. Uncommenting
+# the code below and commenting out the equivalent parameters is convenient for
+# re-tuning.
+# @triton.autotune(
+#    configs=[
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=8),
+#        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+#        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32}, num_stages=3, num_warps=8),
+#        triton.Config({'BLOCK_M': 256, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=4, num_warps=4),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=8),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=7, num_warps=8),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=7, num_warps=8),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=6, num_warps=8),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=5, num_warps=8),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 32}, num_stages=4, num_warps=8),
+#        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=6, num_warps=4),
+#    ],
+#    key=['N_CTX'],
+# )
+
+
+@triton.jit
+def _attn_fwd(Q, K, V, sm_scale, M, L, Out,  #
+              stride_qz, stride_qh, stride_qm, stride_qk,  #
+              stride_kz, stride_kh, stride_kn, stride_kk,  #
+              stride_vz, stride_vh, stride_vk, stride_vn,  #
+              stride_oz, stride_oh, stride_om, stride_on,  #
+              Z, H,  #
+              N_CTX: tl.constexpr,  #
+              BLOCK_M: tl.constexpr,  #
+              BLOCK_DMODEL: tl.constexpr,  #
+              BLOCK_N: tl.constexpr,  #
+              STAGE: tl.constexpr  #
+              ):
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
+    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+
+    # block pointers
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_qm, stride_qk),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_vk, stride_vn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + qvk_offset,
+        shape=(BLOCK_DMODEL, N_CTX),
+        strides=(stride_kk, stride_kn),
+        offsets=(0, 0),
+        block_shape=(BLOCK_DMODEL, BLOCK_N),
+        order=(0, 1),
+    )
+    O_block_ptr = tl.make_block_ptr(
+        base=Out + qvk_offset,
+        shape=(N_CTX, BLOCK_DMODEL),
+        strides=(stride_om, stride_on),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_DMODEL),
+        order=(1, 0),
+    )
+    # initialize offsets
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    # initialize pointer to m and l
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    # load scales
+    qk_scale = sm_scale
+    qk_scale *= 1.44269504  # 1/log(2)
+    # load q: it will stay in SRAM throughout
+    q = tl.load(Q_block_ptr)
+    # stage 1: off-band
+    # For causal = True, STAGE = 3 and _attn_fwd_inner gets 1 as its STAGE
+    # For causal = False, STAGE = 1, and _attn_fwd_inner gets 3 as its STAGE
+    if STAGE & 1:
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
+                                        start_m, qk_scale,  #
+                                        BLOCK_M, BLOCK_DMODEL, BLOCK_N,  #
+                                        4 - STAGE, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                        )
+    # stage 2: on-band
+    if STAGE & 2:
+        # barrier makes it easier for compielr to schedule the
+        # two loops independently
+        tl.debug_barrier()
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, K_block_ptr, V_block_ptr,  #
+                                        start_m, qk_scale,  #
+                                        BLOCK_M, BLOCK_DMODEL, BLOCK_N,  #
+                                        2, offs_m, offs_n, N_CTX, V.dtype.element_ty == tl.float8e5  #
+                                        )
+    # epilogue
+    m_i += tl.math.log2(l_i)
+    acc = acc / l_i[:, None]
+    m_offs = off_hz * N_CTX + offs_m
+    tl.store(M + m_offs, m_i)
+    tl.store(L + m_offs, l_i)
+    tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+
+
+def triton_attn(q, k, v, causal, sm_scale):
+    # shape constraints
+    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+    # when v is in float8_e5m2 it is transposed.
+    assert Lq == Lk and (Lk == Lv or v.dtype == torch.float8_e5m2)
+    assert Lk in {16, 32, 64, 128, 256}
+    o = torch.empty_like(q)
+    BLOCK_M = 128
+    BLOCK_N = 64 if Lk <= 64 else 32
+    num_stages = 4 if Lk <= 64 else 3
+    num_warps = 4
+    num_stages -=1
+    stage = 3 if causal else 1
+    # Tuning for H100
+    if torch.cuda.get_device_capability()[0] == 9:
+        num_warps = 8
+        num_stages = 7 if Lk >= 64 else 3
+        if v.dtype == torch.float8_e5m2:
+            if Lk < 256:
+                BLOCK_M = 64 if not causal else 128
+                BLOCK_N = 128
+                num_stages = 3 if Lk == 128 else 4
+                num_warps = 4
+            else:
+                BLOCK_M = 128
+                BLOCK_N = 128
+                num_stages = 3
+                num_warps = 8
+    grid = (triton.cdiv(q.shape[2], BLOCK_M), q.shape[0] * q.shape[1], 1)
+    M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+    L = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+
+    _attn_fwd[grid](
+        q, k, v, sm_scale, M, L, o,  #
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+        q.shape[0], q.shape[1],  #
+        N_CTX=q.shape[2],  #
+        BLOCK_M=BLOCK_M,  #
+        BLOCK_N=BLOCK_N,  #
+        BLOCK_DMODEL=Lk,  #
+        STAGE=stage,  #
+        num_warps=num_warps,  #
+        num_stages=num_stages  #
+    )
+    
+    return o
+
+def chunk_attn(p, q, k, v, P, B, L, H, D, offset): 
     """
     Pager: [B, L]       uint16
     Q: [B, H, D]        dtype
@@ -765,20 +1154,75 @@ def page_flash_attn(p, q, k, v, P, B, L, H, D):
     O: [B, H, D]        dtype
     No mask is needed as everything is synced to length L
     """
-    # either store transposed or transpose here
-    #k = k.transpose(1, 2)
-    #v = v.transpose(1, 2)
+    q_T = q.transpose(0, 1).contiguous().view(1, H, B, D)
+    k_T = k.view(1, H, P, D)[:, :, :offset, :]
+    v_T = v.view(1, H, P, D)[:, :, :offset, :]
     # q doesn't need to be transposed because L=1
-    o = torch.empty((B, H, D), device=q.device, dtype=DTYPE_torch)
 
-    # 1D launch kernel across B, H, parallelize L & D
-    # typical sizes B=1-100, H = 32, so ~32-3200 kernels
+    # NO PAGING IN THE CHUNKING PART!
+    # shape constraints
+    Lq, Lk, Lv = q_T.shape[-1], k_T.shape[-1], v_T.shape[-1]
+    # when v is in float8_e5m2 it is transposed.
+    assert Lq == Lk and (Lk == Lv or v_T.dtype == torch.float8_e5m2)
+    assert Lk in {16, 32, 64, 128, 256}
+    o = torch.empty_like(q_T)
+    BLOCK_M = 128
+    BLOCK_N = 64 if Lk <= 64 else 32
+    num_stages = 4 if Lk <= 64 else 3
+    num_warps = 4
+    num_stages -=1
+    stage = 1 #if not causal else 3
+    # Tuning for H100
+    if torch.cuda.get_device_capability()[0] == 9:
+        num_warps = 8
+        num_stages = 7 if Lk >= 64 else 3
+        if v.dtype == torch.float8_e5m2:
+            if Lk < 256:
+                BLOCK_M = 64 #if not causal else 128
+                BLOCK_N = 128
+                num_stages = 3 if Lk == 128 else 4
+                num_warps = 4
+            else:
+                BLOCK_M = 128
+                BLOCK_N = 128
+                num_stages = 3
+                num_warps = 8
+    grid = (triton.cdiv(q_T.shape[2], BLOCK_M), q_T.shape[0] * q_T.shape[1], 1)
+    M = torch.empty((q_T.shape[0], q_T.shape[1], q_T.shape[2]),
+                    device=q.device, dtype=torch.float32)
+    D_mat = torch.empty((q_T.shape[0], q_T.shape[1], q_T.shape[2]),
+                    device=q.device, dtype=torch.float32)
+
+    _attn_fwd[grid](
+        q_T, k_T, v_T, 1/math.sqrt(D), M, D_mat, o,  #
+        q_T.stride(0), q_T.stride(1), q_T.stride(2), q_T.stride(3),  #
+        k_T.stride(0), k_T.stride(1), k_T.stride(2), k_T.stride(3),  #
+        v_T.stride(0), v_T.stride(1), v_T.stride(2), v_T.stride(3),  #
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+        q_T.shape[0], q_T.shape[1],  #
+        N_CTX=q.shape[2],  #
+        BLOCK_M=BLOCK_M,  #
+        BLOCK_N=BLOCK_N,  #
+        BLOCK_DMODEL=Lk,  #
+        STAGE=stage,  #
+        num_warps=num_warps,  #
+        num_stages=num_stages  #
+    )
+
+    # Q = (B, H, S, D) (1, H, B, D)
+    # O = (B, H, S, D) (1, H, B, D)
+    # M = L = (B, H, S) (1, H, B)
+    #o = torch.empty((B, H, D), device=q.device, dtype=DTYPE_torch)
+    #m = torch.empty((B, H), device=q.device, dtype=DTYPE_torch)
+    #d = torch.empty((B, H), device=q.device, dtype=DTYPE_torch)
+    o = o.to(DTYPE_torch).reshape(H, B, D).transpose(0, 1).contiguous()
+    m = M.to(DTYPE_torch).reshape(H, B).transpose(0, 1).contiguous()
+    d = D_mat.to(DTYPE_torch).reshape(H, B).transpose(0, 1).contiguous()
+
     grid = lambda META: (B, H)
-    #print(B, L, H, D)
-    #print(q.stride(0), k.stride(0), v.stride(0), o.stride(0))
-    #print(B*H*D, B*H*L*D, B*H*L*D, B*H*D)
-
-    page_flash_attn_kernel2[grid](p, q, k, v, o, 1/math.sqrt(D), 
-                            p.stride(0), q.stride(0), k.stride(0), k.stride(1), o.stride(0), 
-                            P, B, L, H, D, 16)
+    #print(L, offset)
+    page_flash_attn_kernel3[grid](p, q, k, v, o, m, d, 1/math.sqrt(D), 
+                            p.stride(0), q.stride(0), k.stride(0), k.stride(1), 
+                            o.stride(0), m.stride(0), offset,
+                            P, B, L, H, D, 32)
     return o #O doesn't need to be transposed either... since L=1

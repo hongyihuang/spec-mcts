@@ -152,7 +152,7 @@ def remap_names(file):
     
     return model_dict
 
-model_dir = './CodeLlama-70b-Instruct-hf/'
+model_dir = './CodeLlama-7b-Instruct-hf/'
 dir = os.listdir(model_dir)
 # access all {x}-of-00003.bin files
 print(dir)
@@ -198,4 +198,4 @@ for k,v in list(model_dict.items()):
     else:
         print(k, v.shape, v.dtype)
 
-torch.save(model_dict, "./spec-mcts/models/llama70b_q40_T.pth")
+torch.save(model_dict, "./spec-mcts/models/llama7b_q40_T.pth")

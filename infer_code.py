@@ -58,8 +58,8 @@ Given test cases:
 DEVICE = "cuda"
 DTYPE = torch.float16
 GROUP_SIZE = 64
-TEMP = 0.1
-BATCH_SIZE = 1
+TEMP = 1.0
+BATCH_SIZE = 100
 SEQ_LEN = 256
 PROMPT_LEN = 512
 
@@ -139,7 +139,7 @@ def remap_names(file):
     
     return model_dict
 
-model_file = './spec-mcts/models/llama7b_q40.pth'
+model_file = './spec-mcts/models/llama7b_q40_T.pth'
 
 model_dict = {}
 print("Loading file: ", model_file)

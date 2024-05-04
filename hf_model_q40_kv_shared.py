@@ -226,7 +226,6 @@ class LinearQ4_0(torch.nn.Module):
         # there are no good ways to do this currently due to pytorch API doesn't save added params that are non-differentiable
 
     def forward(self, x):
-        """
         shape = x.shape
         x=x.view((shape[0]*shape[1], -1)) # first dim is always 0, to optimize kernel we need 2d array
         start = time.time()
@@ -243,6 +242,7 @@ class LinearQ4_0(torch.nn.Module):
         global COMP_TIME, DEQ_TIME
         COMP_TIME += time.time() - end
         DEQ_TIME += end - start
+        """
         #print(x.shape, "x", self.shape)
         
         #print("DQ/Compute Time: ", (end - start)/(time.time() - end))
