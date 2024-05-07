@@ -227,15 +227,16 @@ SAVE_PATH = f"./spec-mcts/stats/infer_t{TEMP}_q{SEQ_LEN}_b{BATCH_SIZE}"
 for i in tqdm(range(rows), desc="Tasks"):
     print(f"Running row {i}")
     success = True
-    PROMPT = f'''[INST] <<SYS>> You are a programmer, write a python function that passes the given tests. <</SYS>>
+    PROMPT = """[INST] <<SYS>> You are a programmer, write a python function that passes the given tests. <</SYS>>
 Function task: 
-{desc[i]}
+{0}
 
 Given test cases: 
-{"\n".join(test[i])}
+{1}
 [/INST]
 [PYTHON]
-{setup[i]}'''
+{2}"""
+    PROMPT = PROMPT.format(desc[i], "\n".join(test[i]), setup[i])
     input_ids = tokenizer(PROMPT, return_tensors="pt")["input_ids"]
     input_ids = input_ids.to(DEVICE)
     if (input_ids.numel() > PROMPT_LEN):

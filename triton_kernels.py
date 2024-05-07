@@ -757,7 +757,7 @@ def page_flash_attn_kernel2(
         last_m = m
         last_d = d
         last_o = o
-    #tl.debug_barrier()
+    tl.debug_barrier()
     # b * H * D // * o_stride0
     tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
 
@@ -848,7 +848,7 @@ def page_flash_attn_kernel3(
         last_m = m
         last_d = d
         last_o = o
-    #tl.debug_barrier()
+    tl.debug_barrier()
     # b * H * D // * o_stride0
     tl.store(o_ptr + b * o_stride0 + h * D + tl.arange(0, D)[:, None], o)
 
@@ -1019,11 +1019,14 @@ def _attn_fwd(Q, K, V, sm_scale, M, L, Out,  #
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
-    qvk_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    q_offset = off_z.to(tl.int64) * stride_qz + off_h.to(tl.int64) * stride_qh
+    k_offset = off_z.to(tl.int64) * stride_kz + off_h.to(tl.int64) * stride_kh
+    v_offset = off_z.to(tl.int64) * stride_vz + off_h.to(tl.int64) * stride_vh
+    o_offset = off_z.to(tl.int64) * stride_oz + off_h.to(tl.int64) * stride_oh
 
     # block pointers
     Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
+        base=Q + q_offset,
         shape=(N_CTX, BLOCK_DMODEL),
         strides=(stride_qm, stride_qk),
         offsets=(start_m * BLOCK_M, 0),
@@ -1031,7 +1034,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, L, Out,  #
         order=(1, 0),
     )
     V_block_ptr = tl.make_block_ptr(
-        base=V + qvk_offset,
+        base=V + v_offset,
         shape=(N_CTX, BLOCK_DMODEL),
         strides=(stride_vk, stride_vn),
         offsets=(0, 0),
@@ -1039,7 +1042,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, L, Out,  #
         order=(1, 0),
     )
     K_block_ptr = tl.make_block_ptr(
-        base=K + qvk_offset,
+        base=K + k_offset,
         shape=(BLOCK_DMODEL, N_CTX),
         strides=(stride_kk, stride_kn),
         offsets=(0, 0),
@@ -1047,7 +1050,7 @@ def _attn_fwd(Q, K, V, sm_scale, M, L, Out,  #
         order=(0, 1),
     )
     O_block_ptr = tl.make_block_ptr(
-        base=Out + qvk_offset,
+        base=Out + o_offset,
         shape=(N_CTX, BLOCK_DMODEL),
         strides=(stride_om, stride_on),
         offsets=(start_m * BLOCK_M, 0),
@@ -1105,7 +1108,7 @@ def triton_attn(q, k, v, causal, sm_scale):
     BLOCK_N = 64 if Lk <= 64 else 32
     num_stages = 4 if Lk <= 64 else 3
     num_warps = 4
-    num_stages -=1
+    #num_stages -=1
     stage = 3 if causal else 1
     # Tuning for H100
     if torch.cuda.get_device_capability()[0] == 9:
@@ -1189,9 +1192,9 @@ def chunk_attn(p, q, k, v, P, B, L, H, D, offset):
                 num_warps = 8
     grid = (triton.cdiv(q_T.shape[2], BLOCK_M), q_T.shape[0] * q_T.shape[1], 1)
     M = torch.empty((q_T.shape[0], q_T.shape[1], q_T.shape[2]),
-                    device=q.device, dtype=torch.float32)
+                    device=q_T.device, dtype=torch.float32)
     D_mat = torch.empty((q_T.shape[0], q_T.shape[1], q_T.shape[2]),
-                    device=q.device, dtype=torch.float32)
+                    device=q_T.device, dtype=torch.float32)
 
     _attn_fwd[grid](
         q_T, k_T, v_T, 1/math.sqrt(D), M, D_mat, o,  #

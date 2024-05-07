@@ -11,6 +11,8 @@ from triton_matmul import matmul_split_k
 DTYPE_torch = torch.float16
 DTYPE_triton = tl.float16
 
+torch.backends.cuda.enable_flash_sdp(True)
+
 '''
 print("""De-quantization""")
 torch.manual_seed(0)
@@ -364,36 +366,123 @@ def benchmark(B, provider):
 #benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
 
 print("""Paged Flash Attention""")
+def rand_paged_qkv(B, L, H, D, prompt_L, seed = 1, verbose = False): 
+    gen_L = L - prompt_L
+    P = 2**(math.floor(math.log(prompt_L + B*gen_L, 2))+1)
+    if verbose:
+        print(B, prompt_L, gen_L)
+
+    torch.manual_seed(1)
+    q = torch.empty((B, 1, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
+    k = torch.empty((B, gen_L, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
+    v = torch.empty((B, gen_L, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
+    prompt_k = torch.empty((1, prompt_L, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
+    prompt_v = torch.empty((1, prompt_L, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
+
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
+    prompt_k = prompt_k.transpose(1, 2).contiguous()
+    prompt_v = prompt_v.transpose(1, 2).contiguous()
+
+    torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2)
+    torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2)
+
+    pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
+    pager[:B, :prompt_L] = torch.arange(prompt_L, device='cuda').expand(B, -1)
+    #initialize rest of pages
+    pager[:B, prompt_L:prompt_L+gen_L] = torch.arange(B*gen_L, device='cuda').reshape(B, gen_L)+prompt_L
+
+    k_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
+    v_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
+    k_pages[:, :prompt_L, :] = prompt_k[0] # H, L//2, D
+    v_pages[:, :prompt_L, :] = prompt_v[0] # H, L//2, D
+    k_pages[:, prompt_L : prompt_L+B*gen_L, :] = k.transpose(0, 1).reshape(H, B*gen_L, D)
+    v_pages[:, prompt_L : prompt_L+B*gen_L, :] = v.transpose(0, 1).reshape(H, B*gen_L, D)
+
+    return P, q, torch_k, torch_v, pager, k_pages, v_pages
+
+""" Alternative implementation by filling the pages then expanding to non page version
+    gen_L = L - prompt_L
+    P = 2**(math.floor(math.log(prompt_L + B*gen_L, 2))+1)
+    if verbose:
+        print(B, prompt_L, gen_L, branch_L, full_L, page_L, P)
+
+    torch.manual_seed(1)
+    q = torch.empty((B, 1, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
+    q = q.transpose(1, 2).contiguous()
+
+    pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
+    pager[:B, :prompt_L] = torch.arange(prompt_L, device='cuda').expand(B, -1)
+    #initialize rest of pages
+    pager[:B, prompt_L:prompt_L+gen_L] = torch.arange(B*gen_L, device='cuda').reshape(B, gen_L)+prompt_L
+
+    k_pages = torch.empty((H, P, D), dtype=DTYPE_torch, device='cuda').normal_(mean=0.0, std=0.5)
+    v_pages = torch.empty((H, P, D), dtype=DTYPE_torch, device='cuda').normal_(mean=0.0, std=0.5)
+    # [H, prompt_L, D] -> [1, H, L, D]
+    prompt_k = k_pages[:, :prompt_L, :].reshape(1, H, prompt_L, D)
+    prompt_v = v_pages[:, :prompt_L, :].reshape(1, H, prompt_L, D)
+    # [H, P, D] -> [H, B, L, D] -> [B, H, L, D]
+    k = k_pages[:, prompt_L : prompt_L+B*gen_L, :].reshape(H, B, gen_L, D).transpose(0, 1).contiguous()
+    v = v_pages[:, prompt_L : prompt_L+B*gen_L, :].reshape(H, B, gen_L, D).transpose(0, 1).contiguous()
+
+    torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2).contiguous()
+    torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2).contiguous()
+"""
+
+def branch_paged_qkv(B, L, H, D, prompt_L, seed = 1, verbose = False): 
+    # create page full of random numbers, then map with a branch/fork factor of 1
+    gen_L = L - prompt_L
+    branch_L = min(B, gen_L)
+    full_L = gen_L - branch_L
+    #page_L = prompt_L + (((1+branch_L)*branch_L)//2) + full_L * B
+    #P = 2**(math.floor(math.log(page_L, 2))+1)
+    if verbose:
+        print(B, prompt_L, gen_L)
+
+    torch.manual_seed(1)
+    q = torch.empty((B, 1, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
+    q = q.transpose(1, 2).contiguous()
+
+    pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
+    pager[:B, :prompt_L] = torch.arange(prompt_L, device='cuda').expand(B, -1)
+    
+    #initialize rest of pages
+    page_idx = prompt_L
+    b = 1
+    for i in range(prompt_L, L):
+        if b < B: # fork
+            pager[b, :i] = pager[b-1, :i]
+            b += 1
+        offs_p = page_idx + torch.arange(0, b)
+        #if verbose:
+        #    print(i, b, offs_p)
+        page_idx += b
+        pager[:b, i] = offs_p
+
+    P = 2**(math.floor(math.log(page_idx, 2))+1)
+    k_pages = torch.empty((H, P, D), dtype=DTYPE_torch, device='cuda').normal_(mean=0.0, std=0.5)
+    v_pages = torch.empty((H, P, D), dtype=DTYPE_torch, device='cuda').normal_(mean=0.0, std=0.5)
+
+    torch_k = torch.empty((B, H, L, D), dtype=DTYPE_torch, device='cuda')
+    torch_v = torch.empty((B, H, L, D), dtype=DTYPE_torch, device='cuda')
+    if verbose:
+        print("Copying pages...")
+    
+    torch_k[:B, :, :L, :] = k_pages[:, pager[:B, :L].to(torch.int), :].transpose(0, 1)
+    torch_v[:B, :, :L, :] = v_pages[:, pager[:B, :L].to(torch.int), :].transpose(0, 1)
+
+    return P, q, torch_k, torch_v, pager, k_pages, v_pages
+
 # 101*256*4096*2(fp16)*2(KV) = 423MB
 # 32*423MB = 13.5GB
-B = 100
+B = 27
 L = 512
 H = 32
 D = 4096//H
-P = 2**(math.floor(math.log(L//2 + B*L//2, 2))+1)
-print("P: ", P, "L//2: ", L//2)
+prompt_L = 256
 
-torch.manual_seed(1)
-q = torch.randn((B, 1, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-k = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-v = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-prompt_k = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-prompt_v = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-
-torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2)
-torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2)
-
-pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
-pager[:B, :L//2] = torch.arange(L//2, device='cuda').expand(B, -1)
-#initialize rest of pages
-pager[:B, L//2:] = torch.arange(B*L//2, device='cuda').reshape(B, L//2)+L//2
-
-k_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-v_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-k_pages[:, :L//2, :] = prompt_k[0] # H, L//2, D
-v_pages[:, :L//2, :] = prompt_v[0] # H, L//2, D
-k_pages[:, L//2 : L//2+B*L//2, :] = k.transpose(0, 1).reshape(H, B*L//2, D)
-v_pages[:, L//2 : L//2+B*L//2, :] = v.transpose(0, 1).reshape(H, B*L//2, D)
+P, q, torch_k, torch_v, pager, k_pages, v_pages = branch_paged_qkv(B, L, H, D, prompt_L, seed = 1, verbose=True)
 
 torch_output = F.scaled_dot_product_attention(q, torch_k, torch_v)
 triton_output = page_flash_attn(pager, q.view(B, H, D), k_pages, v_pages, P, B, L, H, D).view(B, 1, H, D).transpose(1, 2)
@@ -402,6 +491,12 @@ if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
     print("✅ Triton and Torch match")
 else:
     print("❌ Triton and Torch differ")
+
+"""L = 512
+H = 32
+D = 4096//H
+prompt_L = 256
+P, q, torch_k, torch_v, pager, k_pages, v_pages = branch_paged_qkv(B, L, H, D, prompt_L, seed = 1)"""
 
 configs = []
 configs.append(
@@ -412,8 +507,8 @@ configs.append(
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
         line_vals=["pytorch", "triton"],  # Label name for the lines
-        line_names=["PyTorch", "Triton"],  # Line styles
-        styles=[("green", "-"), ("blue", "-")],
+        line_names=["Flash", "Tree"],  # Line styles
+        styles=[("red", "-"), ("blue", "-")],
         ylabel="ms",  # Label name for the y-axis
         plot_name="paged_flash_attn",  # Name for the plot, used also as a file name for saving the plot.
         args={},
@@ -423,83 +518,52 @@ def benchmark(B, provider):
     L = 512
     H = 32
     D = 4096//H
-    P = 2**(math.floor(math.log(L//2 + B*L//2, 2))+1)
+    prompt_L = 256
+    P, q, torch_k, torch_v, pager, k_pages, v_pages = branch_paged_qkv(B, L, H, D, prompt_L, seed = 1)
 
-    torch.manual_seed(1)
-    q = torch.randn((B, 1, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    k = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    v = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    prompt_k = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    prompt_v = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-
-    torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2)
-    torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2)
-
-    pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
-    pager[:B, :L//2] = torch.arange(L//2, device='cuda').expand(B, -1)
-    #initialize rest of pages
-    pager[:B, L//2:] = torch.arange(B*L//2, device='cuda').reshape(B, L//2)+L//2
-
-    k_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-    v_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-    k_pages[:, :L//2, :] = prompt_k[0] # H, L//2, D
-    v_pages[:, :L//2, :] = prompt_v[0] # H, L//2, D
-    k_pages[:, L//2 : L//2+B*L//2, :] = k.transpose(0, 1).reshape(H, B*L//2, D)
-    v_pages[:, L//2 : L//2+B*L//2, :] = v.transpose(0, 1).reshape(H, B*L//2, D)
+    # P, q
+    """torch_k = torch_k[:B, :]
+    torch_v = torch_v[:B, :]
+    pager = pager[:B, :].contiguous()
+    k_pages = k_pages[:, :B, :].contiguous()
+    v_pages = v_pages[:, :B, :].contiguous()"""
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'pytorch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, torch_k, torch_v), 
                                                      quantiles=quantiles)
     if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: page_flash_attn(pager, q.view(B, H, D), k_pages, v_pages, P, B, L, H, D).view(B, 1, H, D).transpose(1, 2),
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: page_flash_attn(pager, q.view(B, H, D), k_pages, v_pages, 
+                                                                             P, B, L, H, D).view(B, 1, H, D).transpose(1, 2),
                                                                              quantiles=quantiles)
     perf = lambda ms: ms #2 * M * N * K * 1e-12 / (ms * 1e-3)
+
+    torch_output = F.scaled_dot_product_attention(q, torch_k, torch_v)
+    triton_output = page_flash_attn(pager, q.view(B, H, D), k_pages, v_pages, P, B, L, H, D).view(B, 1, H, D).transpose(1, 2)
+
+    if torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0):
+        print(f"B ={B} ✅ Triton and Torch match")
+    else:
+        print(f"B ={B} ❌ Triton and Torch differ")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
     return perf(ms), perf(max_ms), perf(min_ms)
 
-benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
-
+benchmark.run(print_data=True, save_path='./spec-mcts/stats/') #show_plots=True
 
 print("""Chunk Attention""")
 # 101*256*4096*2(fp16)*2(KV) = 423MB
 # 32*423MB = 13.5GB
-B = 100
+B = 27
 L = 512
 H = 32
 D = 4096//H
-P = 2**(math.floor(math.log(L//2 + B*L//2, 2))+1)
-print("P: ", P, "L//2: ", L//2)
+prompt_L = 233
 
-torch.manual_seed(0)
-q = torch.empty((B, 1, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
-k = torch.empty((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
-v = torch.empty((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
-prompt_k = torch.empty((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
-prompt_v = torch.empty((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).normal_(mean=0.0, std=0.5)
-
-q = q.transpose(1, 2).contiguous()
-k = k.transpose(1, 2).contiguous()
-v = v.transpose(1, 2).contiguous()
-prompt_k = prompt_k.transpose(1, 2).contiguous()
-prompt_v = prompt_v.transpose(1, 2).contiguous()
-
-torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2)
-torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2)
-
-pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
-pager[:B, :L//2] = torch.arange(L//2, device='cuda').expand(B, -1)
-#initialize rest of pages
-pager[:B, L//2:] = torch.arange(B*L//2, device='cuda').reshape(B, L//2)+L//2
-
-k_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-v_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-k_pages[:, :L//2, :] = prompt_k[0] # H, L//2, D
-v_pages[:, :L//2, :] = prompt_v[0] # H, L//2, D
-k_pages[:, L//2 : L//2+B*L//2, :] = k.transpose(0, 1).reshape(H, B*L//2, D)
-v_pages[:, L//2 : L//2+B*L//2, :] = v.transpose(0, 1).reshape(H, B*L//2, D)
+P, q, torch_k, torch_v, pager, k_pages, v_pages = branch_paged_qkv(B, L, H, D, prompt_L, seed = 1, verbose=True)
 
 torch_output = F.scaled_dot_product_attention(q, torch_k, torch_v)
-triton_output = chunk_attn(pager, q.view(B, H, D), k_pages, v_pages, P, B, L, H, D, L//2).view(B, 1, H, D).transpose(1, 2)
+triton_output = chunk_attn(pager, q.view(B, H, D), k_pages, v_pages, P, B, L, H, D, prompt_L).view(B, 1, H, D).transpose(1, 2)
 
 if torch.allclose(triton_output, torch_output, atol=2e-1, rtol=0):
     print("✅ Triton and Torch match")
@@ -514,13 +578,13 @@ configs = []
 configs.append(
     triton.testing.Benchmark(
         x_names=["B"],  # Argument names to use as an x-axis for the plot
-        x_vals=[1 * i for i in range(1, 64)],  # Different possible values for `x_name`
+        x_vals=[1 * i for i in range(1, 100)],  # Different possible values for `x_name`
         line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
         # Possible values for `line_arg`
         # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-        line_vals=["pytorch", "triton"],  # Label name for the lines
-        line_names=["PyTorch", "Chunk+Page"],  # Line styles
-        styles=[("green", "-"), ("blue", "-")],
+        line_vals=["flash", "page", "chunk"],  # Label name for the lines
+        line_names=["Flash", "Flash+Page", "Flash+Page+Chunk"],  # Line styles
+        styles=[("red", "-"), ("yellow", "-"), ("green", "-")],
         ylabel="ms",  # Label name for the y-axis
         plot_name="chunk_attn",  # Name for the plot, used also as a file name for saving the plot.
         args={},
@@ -530,43 +594,32 @@ def benchmark(B, provider):
     L = 512
     H = 32
     D = 4096//H
-    P = 2**(math.floor(math.log(L//2 + B*L//2, 2))+1)
-
-    torch.manual_seed(1)
-    q = torch.randn((B, 1, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    k = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    v = torch.randn((B, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    prompt_k = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-    prompt_v = torch.randn((1, L//2, H, D), device='cuda', dtype=DTYPE_torch).transpose(1, 2)
-
-    torch_k = torch.cat((prompt_k.expand(B, -1, -1, -1), k), dim=2)
-    torch_v = torch.cat((prompt_v.expand(B, -1, -1, -1), v), dim=2)
-
-    pager = torch.zeros((B, L), dtype=torch.int16, device='cuda')
-    pager[:B, :L//2] = torch.arange(L//2, device='cuda').expand(B, -1)
-    #initialize rest of pages
-    pager[:B, L//2:] = torch.arange(B*L//2, device='cuda').reshape(B, L//2)+L//2
-
-    k_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-    v_pages = torch.zeros((H, P, D), dtype=DTYPE_torch, device='cuda')
-    k_pages[:, :L//2, :] = prompt_k[0] # H, L//2, D
-    v_pages[:, :L//2, :] = prompt_v[0] # H, L//2, D
-    k_pages[:, L//2 : L//2+B*L//2, :] = k.transpose(0, 1).reshape(H, B*L//2, D)
-    v_pages[:, L//2 : L//2+B*L//2, :] = v.transpose(0, 1).reshape(H, B*L//2, D)
-    print("B: ", B, "P: ", P, "L//2: ", L//2)
+    prompt_L = 256
+    if provider == 'chunk':
+        P, q, torch_k, torch_v, pager, k_pages, v_pages = rand_paged_qkv(B, L, H, D, prompt_L, seed = 0)
+    else:
+        P, q, torch_k, torch_v, pager, k_pages, v_pages = branch_paged_qkv(B, L, H, D, prompt_L, seed = 1)
 
     quantiles = [0.5, 0.2, 0.8]
-    if provider == 'pytorch':
+    if provider == 'flash':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: F.scaled_dot_product_attention(q, torch_k, torch_v), 
                                                      quantiles=quantiles)
-    if provider == 'triton':
+    if provider == 'page':
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: page_flash_attn(pager, q.view(B, H, D), k_pages, v_pages, 
+                                                                             P, B, L, H, D).view(B, 1, H, D).transpose(1, 2),
+                                                                             quantiles=quantiles)
+    if provider == 'chunk':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: chunk_attn(pager, q.view(B, H, D), k_pages, v_pages, 
-                                                                        P, B, L, H, D, L//2).view(B, 1, H, D).transpose(1, 2),
+                                                                        P, B, L, H, D, prompt_L).view(B, 1, H, D).transpose(1, 2),
                                                                         quantiles=quantiles)
     perf = lambda ms: ms #2 * M * N * K * 1e-12 / (ms * 1e-3)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    print(provider, B)
+
     return perf(ms), perf(max_ms), perf(min_ms)
 
-#benchmark.run(show_plots=True, print_data=True, save_path='./spec-mcts/stats/')
+benchmark.run(print_data=True, save_path='./spec-mcts/stats/')#show_plots=True
 
 print("""Triton Attention""")
 def test_op(B, H, L, D, dtype=torch.float16):
